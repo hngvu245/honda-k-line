@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- WCH CH340 / CH341 / CH34x -->
+    <usb-device vendor-id="6790" />
+    <!-- Silicon Labs CP2101 / CP2102 / CP2104 / CP2105 / CP2108 -->
+    <usb-device vendor-id="4292" />
+    <!-- FTDI FT232R / FT2232 / FT4232 / FT230X -->
+    <usb-device vendor-id="1027" />
+    <!-- Prolific PL2303 -->
+    <usb-device vendor-id="1659" />
+    <!-- STM32 Virtual COM Port -->
+    <usb-device vendor-id="1155" />
+    <!-- Espressif ESP32-C3 / ESP32-S3 USB-JTAG/Serial CDC -->
+    <usb-device vendor-id="12346" />
+    <!-- Qinheng Microelectronics (0x4348) -->
+    <usb-device vendor-id="17224" />
+</resources>

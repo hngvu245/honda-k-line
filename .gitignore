@@ -1,0 +1,25 @@
+# === Build & Toolchain Artifacts ===
+__pycache__/
+*.py[cod]
+*.log
+
+# STM32 / Keil uVision generated outputs & user layouts
+firmware/stm32-legacy/Drivers/
+firmware/stm32-legacy/MDK-ARM/honda_test/
+firmware/stm32-legacy/MDK-ARM/DebugConfig/
+firmware/stm32-legacy/MDK-ARM/RTE/
+firmware/stm32-legacy/MDK-ARM/*.lst
+firmware/stm32-legacy/MDK-ARM/*.uvguix.*
+
+# Android APK build intermediates, keystores & release binaries (upload APK to GitHub Releases)
+software/android-apk/build/
+software/android-apk/*.apk
+software/android-apk/*.apk.idsig
+
+# Large local capture log & external nested skill repo
+software/logs/kline_debug.log
+skills/taste-skill/
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db

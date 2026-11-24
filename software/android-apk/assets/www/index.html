@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#090A0D" />
+  <title>Keihin K-Line · Honda HMI</title>
+  <link rel="stylesheet" href="fonts.css" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div class="accent-bar" aria-hidden="true"></div>
+
+  <!-- ========================================================= -->
+  <!-- SHARED REPLAY TIMELINE STRIP (PORTRAIT & LANDSCAPE)       -->
+  <!-- ========================================================= -->
+  <div class="replay-bar" id="sharedReplayBar" hidden>
+    <button type="button" class="btn btn--touch" id="replayPlayBtn">Dừng</button>
+    <div class="speed-group" role="group" aria-label="Tốc độ phát">
+      <button type="button" class="speed-btn" data-speed="0.5">0.5x</button>
+      <button type="button" class="speed-btn active" data-speed="1">1x</button>
+      <button type="button" class="speed-btn" data-speed="4">4x</button>
+    </div>
+    <input type="range" class="replay-slider" id="replaySlider" min="0" max="409" value="0" aria-label="Tua thời gian log" />
+    <span class="replay-time" id="replayTimeTxt">00:00 / 00:41</span>
+  </div>
+
+  <!-- ========================================================= -->
+  <!-- PORTRAIT MOBILE APP SHELL                                 -->
+  <!-- ========================================================= -->
+  <div class="portrait-app" id="portraitApp">
+    <header class="app-topbar">
+      <div class="topbar-left">
+        <div class="brand-badge">
+          <img src="img/logo_hvu.png" class="brand-icon" alt="HVU" />
+          <span class="brand-title">hvu24.5</span>
+        </div>
+        <span class="conn-pill">
+          <span class="conn-dot" id="pConnDot"></span>
+          <span id="pConnText">Chưa kết nối</span>
+        </span>
+      </div>
+
+      <div class="topbar-right">
+        <button type="button" class="btn btn--touch btn--fi" id="pBtnFi" title="Đèn báo lỗi FI">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10h2l2-3h7l2 3h3v7h-3l-2 2H8l-2-2H4v-7z"/><path d="M10 4h4M12 4v3"/></svg>
+          <span>FI</span>
+        </button>
+        <button type="button" class="btn btn--touch btn--rec" id="pBtnRec" title="Ghi log CSV">
+          <span class="rec-dot"></span>
+          <span id="pRecTxt">REC</span>
+        </button>
+        <button type="button" class="btn btn--touch btn--mode" id="pBtnModeCycle">CASUAL</button>
+        <button type="button" class="btn btn--touch" id="pBtnDemo">Demo</button>
+        <button type="button" class="btn btn--touch btn--bt" id="pBtnBt" title="Bluetooth">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 7 10 10-5 5V2l5 5L7 17"/></svg>
+          <span class="bt-dot" id="pBtDot"></span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Scrollable Page Host -->
+    <main class="app-scroll">
+      <!-- ==================== CASUAL OVERVIEW ==================== -->
+      <section class="page page--overview" id="page-casual-overview" data-mode="casual" data-tab="overview">
+        <div class="health-banner" id="casualBanner">
+          <span class="conn-dot" id="cHealthDot"></span>
+          <span class="health-txt" id="cHealthText">Sẵn sàng kết nối · Bật khóa xe hoặc chạy Demo</span>
+        </div>
+
+        <!-- Tier 1: TFT Motorsport Cockpit Hero (Speed + Gear + Tach) -->
+        <div class="mcard mcard--hero mcard--tft is-idle" id="cHeroCard">
+          <div class="tft-tach-top">
+            <div class="tft-rpm-digital">
+              <span class="hero-num" id="cRpm">--</span>
+              <span class="unit unit--sm">RPM</span>
+            </div>
+            <div class="tft-tach-wrap">
+              <div class="shift-leds" id="pCasualLeds"></div>
+              <div class="shift-scale" id="pCasualScale"></div>
+            </div>
+          </div>
+
+          <!-- Speedometer Hero & Gear Box Side-by-Side -->
+          <div class="tft-cockpit-hero">
+            <div class="speedo-box">
+              <div class="speedo-halo">
+                <span class="speedo-num" id="cSpeedNum">0</span>
+                <span class="speedo-unit">km/h</span>
+              </div>
+              <div class="speedo-meta">
+                <span class="peak-badge">ĐỈNH TUA <b id="cPeakHold">--</b></span>
+              </div>
+            </div>
+
+            <div class="gear-box">
+              <span class="gear-tag">GEAR</span>
+              <div class="gear-glow-wrap">
+                <span class="gear-val is-neutral" id="cGearVal">N</span>
+              </div>
+              <span class="gear-sub" id="cGearSub">MO · NEUTRAL</span>
+            </div>
+          </div>
+
+          <!-- Dual Horizontal Gauge Bars: C.TEMP & BATTERY -->
+          <div class="tft-bars-grid">
+            <div class="tft-bar-card">
+              <div class="tft-bar-head">
+                <span class="tft-bar-title">C.TEMP</span>
+                <span class="val-wrap"><span class="num num--sm" id="cEctNum">--</span><span class="unit unit--sm">°C</span></span>
+              </div>
+              <div class="gauge-bar"><div class="gauge-fill gauge-fill--ect" id="cEctFill"></div></div>
+              <div class="sub-line" id="cEctSub">Chờ tín hiệu</div>
+            </div>
+
+            <div class="tft-bar-card">
+              <div class="tft-bar-head">
+                <span class="tft-bar-title">BATTERY</span>
+                <span class="val-wrap"><span class="num num--sm" id="cVbatNum">--</span><span class="unit unit--sm">V</span></span>
+              </div>
+              <div class="gauge-bar"><div class="gauge-fill gauge-fill--bat" id="cVbatFill"></div></div>
+              <div class="sub-line" id="cVbatSub">Min đề: -- V</div>
+            </div>
+          </div>
+
+          <div class="hero-tps-box">
+            <div class="tps-bg-sweep" id="cTpsBgSweep"></div>
+            <div class="hero-tps-top">
+              <div class="card-title">
+                <svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="9"/><path d="M7 17L17 7"/></svg>
+                <span>ĐỘ MỞ GA</span>
+              </div>
+              <div class="tps-right-meta">
+                <span class="sub-chip" id="cTpsMaxChip">Max --%</span>
+                <span class="val-wrap"><span class="num num--md" id="cTpsNum">--</span><span class="unit unit--md">%</span></span>
+              </div>
+            </div>
+            <div class="tps-track"><div class="tps-fill" id="cTpsFill"></div></div>
+          </div>
+        </div>
+
+        <!-- Tier 2: 4 Left-Aligned Casual Cards (No Diagonal Scan Trap) -->
+        <div class="card-grid card-grid--2 is-idle" id="cSecGrid">
+          <div class="mcard mcard--tight">
+            <div class="card-title">
+              <svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0z"/></svg>
+              <span>NHIỆT ĐỘ MÁY</span>
+            </div>
+            <div class="val-wrap"><span class="num" id="cEctNum">--</span><span class="unit">°C</span></div>
+            <div class="sub-line" id="cEctSub">Chờ tín hiệu</div>
+          </div>
+
+          <div class="mcard mcard--tight">
+            <div class="card-title">
+              <svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="2" y="7" width="20" height="13" rx="2"/><path d="M6 7V4h3v3M15 7V4h3v3"/></svg>
+              <span>ĐIỆN BÌNH</span>
+            </div>
+            <div class="val-wrap"><span class="num" id="cVbatNum">--</span><span class="unit">V</span></div>
+            <div class="sub-line" id="cVbatSub">Min đề: -- V</div>
+          </div>
+
+          <div class="mcard mcard--tight">
+            <div class="card-title">
+              <svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 8h13a3 3 0 1 0-3-3M3 12h16a3 3 0 1 1-3 3M3 16h9"/></svg>
+              <span>NHIỆT ĐỘ GIÓ</span>
+            </div>
+            <div class="val-wrap"><span class="num" id="cIatNum">--</span><span class="unit">°C</span></div>
+            <div class="sub-line" id="cIatSub">Cổ hút</div>
+          </div>
+
+          <div class="mcard mcard--tight">
+            <div class="card-title">
+              <svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>
+              <span>TẢI ĐỘNG CƠ</span>
+            </div>
+            <div class="val-wrap"><span class="num num--txt" id="cMapWord">--</span><span class="unit" id="cMapKpaSub"></span></div>
+            <div class="sub-line" id="cMapSub">Áp suất cổ hút</div>
+          </div>
+        </div>
+
+        <!-- Tier 3A: Empty State Connection Checklist (visible when idle) -->
+        <div class="mcard mcard--empty" id="cEmptyChecklist">
+          <div class="section-cap">TRẠNG THÁI KẾT NỐI XE</div>
+          <div class="chk-list">
+            <div class="chk-row">
+              <span class="conn-dot" id="chkBtDot"></span>
+              <span>1. Bluetooth tới cục đọc STM32:</span>
+              <strong id="chkBtTxt">Chưa ghép nối</strong>
+            </div>
+            <div class="chk-row">
+              <span class="conn-dot" id="chkEcuDot"></span>
+              <span>2. Giao tiếp K-Line ECU:</span>
+              <strong id="chkEcuTxt">Chờ bật khóa điện ON</strong>
+            </div>
+          </div>
+          <button type="button" class="btn btn--primary btn--cta" id="cBtnEmptyDemo">Chạy thử dữ liệu mẫu (Demo Xe Thật)</button>
+        </div>
+
+        <!-- Tier 3B: Live Mini Chart Card (visible once signal arrives) -->
+        <div class="mcard mcard--chart" id="cChartCard" hidden>
+          <div class="chart-head">
+            <span class="card-title">BIỂU ĐỒ VÒNG TUA &amp; BƯỚM GA</span>
+            <span class="chart-legend"><i class="dot-cyan"></i>RPM &nbsp; <i class="dot-orange"></i>TPS</span>
+          </div>
+          <canvas id="pOverviewChart" class="overview-canvas"></canvas>
+        </div>
+      </section>
+
+      <!-- ==================== CASUAL TRIP ==================== -->
+      <section class="page" id="page-casual-trip" data-mode="casual" data-tab="trip" hidden>
+        <div class="section-cap">TỔNG QUAN CHUYẾN ĐI</div>
+        <div class="card-grid card-grid--2">
+          <div class="mcard mcard--tight">
+            <span class="card-title">THỜI GIAN NỔ MÁY</span>
+            <div class="val-wrap"><span class="num" id="tRunTime">00:00</span></div>
+          </div>
+          <div class="mcard mcard--tight">
+            <span class="card-title">RPM ĐỈNH</span>
+            <div class="val-wrap"><span class="num accent" id="tPeakRpm">--</span></div>
+          </div>
+          <div class="mcard mcard--tight">
+            <span class="card-title">GA LỚN NHẤT</span>
+            <div class="val-wrap"><span class="num" id="tMaxTpsNum">--</span><span class="unit">%</span></div>
+          </div>
+          <div class="mcard mcard--tight">
+            <span class="card-title">SỐ CẢNH BÁO</span>
+            <div class="val-wrap"><span class="num" id="tWarnCount">0</span></div>
+          </div>
+        </div>
+
+        <div class="section-cap">SỨC KHỎE BÌNH ẮC-QUY &amp; SẠC</div>
+        <div class="mcard">
+          <div class="kv-row"><span>Áp sụt thấp nhất lúc bấm đề</span><strong id="tMinBat">-- V</strong></div>
+          <div class="kv-row"><span>Áp sạc cao nhất ghi nhận</span><strong id="tMaxBat">-- V</strong></div>
+          <div class="kv-row"><span>Đánh giá bình điện</span><strong id="tBatVerdict">Chưa đủ mẫu</strong></div>
+        </div>
+
+        <div class="section-cap">NHẮC BẢO DƯỠNG (THEO GIỜ MÁY CHẠY)</div>
+        <div class="mcard">
+          <div class="kv-row"><span>Chu kỳ thay nhớt máy (25 giờ)</span><strong id="tOilText">0.0 / 25.0 giờ</strong></div>
+          <div class="prog-track"><div class="prog-fill" id="tOilFill"></div></div>
+          <div class="row-actions">
+            <button type="button" class="btn btn--secondary btn--touch" id="btnResetTrip">Reset chuyến</button>
+            <button type="button" class="btn btn--secondary btn--touch" id="btnResetOil">Đã thay nhớt</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== CASUAL DTC ==================== -->
+      <section class="page" id="page-casual-dtc" data-mode="casual" data-tab="dtc" hidden>
+        <div class="mcard">
+          <div class="section-cap">CHẨN ĐOÁN LỖI ĐỘNG CƠ (K-LINE)</div>
+          <p class="muted-note">Đọc lỗi hiện tại, lỗi quá khứ lưu trong ECU và mã phụ tùng qua đường dây K-Line (không cần dây SCS).</p>
+          <div class="row-actions">
+            <button type="button" class="btn btn--primary btn--touch" id="cBtnReadDtc">Kiểm tra lỗi ECU</button>
+            <button type="button" class="btn btn--secondary btn--touch" id="cBtnClearDtc">Xóa lỗi</button>
+          </div>
+        </div>
+
+        <div class="mcard">
+          <div class="kv-row"><span>Mã phụ tùng ECM ID</span><strong id="cEcmId">--</strong></div>
+        </div>
+
+        <div class="dtc-list" id="cDtcList">
+          <div class="mcard">Chưa quét lỗi. Kết nối Bluetooth tới mạch STM32 trên xe rồi bấm "Kiểm tra lỗi ECU".</div>
+        </div>
+      </section>
+
+      <!-- ==================== NERDY SENSORS ==================== -->
+      <section class="page" id="page-nerdy-sensors" data-mode="nerdy" data-tab="sensors" hidden>
+        <div class="mcard mcard--hero-compact is-idle" id="nHeroCard">
+          <div class="shift-leds" id="pNerdyLeds"></div>
+          <div class="shift-scale" id="pNerdyScale"></div>
+          <div class="nerdy-hero-row">
+            <div>
+              <span class="card-title">RPM · PEAK <b id="nPeakRpm">--</b></span>
+              <div class="val-wrap"><span class="hero-num hero-num--sm" id="nRpm">--</span><span class="unit">RPM</span></div>
+            </div>
+            <div class="nerdy-hero-right">
+              <div class="row-actions">
+                <span class="pill-tag" id="nDfcoPill">DFCO</span>
+                <span class="card-title">DUTY <b id="nDutyTop">--</b></span>
+              </div>
+              <button type="button" class="btn btn--mini" id="nBtnResetBounds">Reset Min/Max</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card-grid card-grid--2 is-idle" id="nerdySensorGrid">
+          <div class="ncard">
+            <div class="card-title">TPS · BƯỚM GA</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nTpsNum">--</span><span class="unit unit--sm">%</span></span>
+              <span class="nsub" id="nTpsVolt">-- V</span>
+            </div>
+            <div class="tps-track tps-track--thin"><div class="tps-fill" id="nTpsFill"></div></div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotTps"></div></div>
+            <div class="mm-lbl" id="mmLblTps">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">MAP · ÁP SUẤT NẠP</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nMapNum">--</span><span class="unit unit--sm">kPa</span></span>
+              <span class="nsub" id="nMapSub">-- V</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotMap"></div></div>
+            <div class="mm-lbl" id="mmLblMap">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">INJ · KIM PHUN</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nInjNum">--</span><span class="unit unit--sm">ms</span></span>
+              <span class="nsub" id="nInjSub">Duty --%</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotInj"></div></div>
+            <div class="mm-lbl" id="mmLblInj">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">IGN · ĐÁNH LỬA</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nIgnNum">--</span><span class="unit unit--sm">°</span></span>
+              <span class="nsub" id="nIgnSub">BTDC</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotIgn"></div></div>
+            <div class="mm-lbl" id="mmLblIgn">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">O2 · AFR</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nO2Num">--</span><span class="unit unit--sm">V</span></span>
+              <span class="nsub" id="nO2Sub">AFR --:1</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotO2"></div></div>
+            <div class="mm-lbl" id="mmLblO2">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">IACV · VAN GARANTI</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nIacvNum">--</span><span class="unit unit--sm">stp</span></span>
+              <span class="nsub" id="nIacvSub">Bước van</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotIacv"></div></div>
+            <div class="mm-lbl" id="mmLblIacv">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">ECT · NƯỚC MÁT</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nEctNum">--</span><span class="unit unit--sm">°C</span></span>
+              <span class="nsub" id="nEctSub">-- V</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotEct"></div></div>
+            <div class="mm-lbl" id="mmLblEct">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">IAT · KHÍ NẠP</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nIatNum">--</span><span class="unit unit--sm">°C</span></span>
+              <span class="nsub" id="nIatSub">-- V</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotIat"></div></div>
+            <div class="mm-lbl" id="mmLblIat">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">VBAT · BÌNH ĐIỆN</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nVbatNum">--</span><span class="unit unit--sm">V</span></span>
+              <span class="nsub" id="nVbatSub">Chờ nguồn</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotVbat"></div></div>
+            <div class="mm-lbl" id="mmLblVbat">MIN -- · MAX --</div>
+          </div>
+
+          <div class="ncard">
+            <div class="card-title">VSS · TỐC ĐỘ</div>
+            <div class="ncell-main">
+              <span class="val-wrap"><span class="num num--sm" id="nVssNum">--</span><span class="unit unit--sm">km/h</span></span>
+              <span class="nsub" id="nVssSub">CSUM OK</span>
+            </div>
+            <div class="mm-bar"><div class="mm-dot" id="mmDotVss"></div></div>
+            <div class="mm-lbl" id="mmLblVss">PKT #0</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== NERDY SCOPE ==================== -->
+      <section class="page" id="page-nerdy-scope" data-mode="nerdy" data-tab="scope" hidden>
+        <div class="scope-controls">
+          <div class="chip-row">
+            <button type="button" class="chip active" data-ch="rpm">RPM</button>
+            <button type="button" class="chip active" data-ch="tps">TPS</button>
+            <button type="button" class="chip active" data-ch="map">MAP</button>
+            <button type="button" class="chip" data-ch="inj">INJ</button>
+            <button type="button" class="chip" data-ch="o2">O2</button>
+          </div>
+          <button type="button" class="btn btn--touch" id="btnScopeFreeze">Đóng băng</button>
+        </div>
+
+        <div class="scope-readout" id="scopeCursorReadout">Vuốt ngón tay lên biểu đồ để soi giá trị từng tích tắc</div>
+
+        <div class="mcard scope-box">
+          <canvas id="nScopeCanvas" class="scope-canvas"></canvas>
+        </div>
+      </section>
+
+      <!-- ==================== NERDY DYNO & MAP ==================== -->
+      <section class="page" id="page-nerdy-dyno" data-mode="nerdy" data-tab="dyno" hidden>
+        <div class="mcard">
+          <div class="kv-row">
+            <span class="card-title">PULL TIMER (4,000 → 9,000 RPM)</span>
+            <button type="button" class="btn btn--mini" id="btnResetPull">Reset</button>
+          </div>
+          <div class="pull-row">
+            <div>
+              <div class="muted-note" id="pullStateTxt">CHỜ (&lt; 3,800 RPM để nạp)</div>
+              <div class="num" id="pullCurTxt">--.-- s</div>
+            </div>
+            <div class="pull-best" id="pullBestTxt">BEST --.-- s</div>
+          </div>
+        </div>
+
+        <div class="mcard">
+          <div class="kv-row">
+            <span class="card-title">LIVE MAP (RPM × TPS)</span>
+            <div class="row-actions">
+              <div class="speed-group" id="mapMetricGroup">
+                <button type="button" class="speed-btn active" data-metric="INJ">INJ</button>
+                <button type="button" class="speed-btn" data-metric="IGN">IGN</button>
+                <button type="button" class="speed-btn" data-metric="MAP">MAP</button>
+              </div>
+              <button type="button" class="btn btn--mini" id="btnClearMap">Xóa</button>
+            </div>
+          </div>
+          <div class="map-wrap">
+            <table class="map-table" id="mapTable"></table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== NERDY LAB ==================== -->
+      <section class="page" id="page-nerdy-lab" data-mode="nerdy" data-tab="lab" hidden>
+        <div class="mcard">
+          <div class="section-cap">CAN THIỆP ECU &amp; DÒ BẢNG</div>
+          <div class="lab-btn-grid">
+            <button type="button" class="btn btn--primary btn--touch" id="lBtnReadDtc">Đọc lỗi DTC</button>
+            <button type="button" class="btn btn--secondary btn--touch" id="lBtnReadEcmId">Đọc ECM ID</button>
+            <button type="button" class="btn btn--secondary btn--touch" id="lBtnClearDtc">Xóa lỗi DTC</button>
+            <button type="button" class="btn btn--secondary btn--touch" id="lBtnWakeup">Gửi WAKEUP</button>
+            <button type="button" class="btn btn--secondary btn--touch" id="lBtnScs">SCS: Tắt</button>
+          </div>
+          <div class="probe-row">
+            <input type="text" id="lTableInput" class="hex-input" maxlength="2" value="17" aria-label="Table Hex" />
+            <button type="button" class="btn btn--secondary btn--touch" id="lBtnProbeTable">Thử Table (Hex)</button>
+          </div>
+          <div class="kv-row"><span>ECM ID</span><strong id="lEcmId">--</strong></div>
+          <div class="dtc-mini" id="lDtcOut">Kết quả truy vấn sẽ hiển thị ở đây.</div>
+        </div>
+
+        <div class="mcard">
+          <div class="kv-row">
+            <span class="card-title">NGƯỠNG ĐÈN BÁO SANG SỐ (REDLINE)</span>
+            <strong id="lRedlineVal">9,000 RPM</strong>
+          </div>
+          <input type="range" class="replay-slider" id="lRedlineSlider" min="7000" max="11500" step="250" value="9000" />
+        </div>
+
+        <div class="mcard">
+          <div class="kv-row">
+            <span class="card-title">RAW K-LINE TERMINAL</span>
+            <button type="button" class="btn btn--mini" id="lBtnClearHex">Xóa log</button>
+          </div>
+          <div class="hex-console" id="lHexConsole">Chờ luồng byte từ STM32...</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Fixed Bottom Tab Bar with Crisp SVG Icons -->
+    <nav class="bottom-nav" id="bottomNav" aria-label="Điều hướng">
+      <button type="button" class="bnav-btn active" data-mode="casual" data-tab="overview">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 12l4-4"/></svg>
+        <span>Tổng quan</span>
+      </button>
+      <button type="button" class="bnav-btn" data-mode="casual" data-tab="trip">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17l6-6 4 4 8-8"/></svg>
+        <span>Hành trình</span>
+      </button>
+      <button type="button" class="bnav-btn" data-mode="casual" data-tab="dtc">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>
+        <span>Chẩn đoán</span>
+      </button>
+
+      <button type="button" class="bnav-btn" data-mode="nerdy" data-tab="sensors" hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        <span>Thông số</span>
+      </button>
+      <button type="button" class="bnav-btn" data-mode="nerdy" data-tab="scope" hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h4l3-7 5 14 3-7h5"/></svg>
+        <span>Biểu đồ</span>
+      </button>
+      <button type="button" class="bnav-btn" data-mode="nerdy" data-tab="dyno" hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>
+        <span>Dyno Map</span>
+      </button>
+      <button type="button" class="bnav-btn" data-mode="nerdy" data-tab="lab" hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        <span>ECU Lab</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- ========================================================= -->
+  <!-- LANDSCAPE HANDLEBAR HUD (ZERO-SCROLL 100dvh)              -->
+  <!-- ========================================================= -->
+  <div class="landscape-hud" id="landscapeHud">
+    <!-- Floating Overlay Quick Actions (Hidden in driving mode, opens on badge tap) -->
+    <div class="lhud-overlay-toolbar" id="lhudOverlayToolbar" hidden>
+      <div class="overlay-toolbar-inner">
+        <button type="button" class="btn btn--touch conn-pill" id="lBtnToolbarConnect" title="Mở danh sách kết nối">
+          <span class="conn-dot" id="lConnDot"></span>
+          <span id="lConnText">Chưa kết nối</span>
+        </button>
+        <span class="health-inline" id="lBannerTxt">Bật khóa xe hoặc chạy Demo</span>
+        <div class="overlay-toolbar-btns">
+          <button type="button" class="btn btn--touch btn--fi" id="lBtnFi" title="Đèn báo lỗi FI">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10h2l2-3h7l2 3h3v7h-3l-2 2H8l-2-2H4v-7z"/><path d="M10 4h4M12 4v3"/></svg>
+            <span>FI</span>
+          </button>
+          <button type="button" class="btn btn--touch btn--rec" id="lBtnRec" title="Ghi log CSV">
+            <span class="rec-dot"></span>
+            <span id="lRecTxt">REC</span>
+          </button>
+          <button type="button" class="btn btn--touch btn--mode" id="lBtnModeCycle">CASUAL</button>
+          <button type="button" class="btn btn--touch" id="lBtnDemo">Demo</button>
+          <button type="button" class="btn btn--touch" id="btnCloseToolbar">Đóng</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tier 1: Top RPM Sweep Bar (~16% Height, Edge-to-Edge) -->
+    <div class="tft-rpm-bar">
+      <div class="tft-tach-container">
+        <!-- Digital RPM readout floating above tick 0-1 -->
+        <div class="tft-rpm-digital-float">
+          <span class="tft-rpm-val" id="lcRpm">--</span>
+          <span class="tft-rpm-unit">rpm</span>
+        </div>
+
+        <!-- Mode / Status pill floating above tick 13 -->
+        <div class="tft-rpm-right-meta">
+          <button type="button" class="tft-sim-badge" id="lcModeBadge" title="Bấm để mở bảng điều khiển">SIM</button>
+        </div>
+
+        <!-- Thin redline accent bar over 9-13 -->
+        <div class="tft-redline-accent-line"></div>
+        <div class="lhud-tach">
+          <div class="tft-continuous-sweep" id="lcRpmSweep"></div>
+          <div class="shift-leds" id="lShiftLeds"></div>
+          <div class="shift-scale" id="lShiftScale"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tier 2: Bottom Body Area (~84% Height, 3-Column Cockpit) -->
+    <div class="lhud-casual is-idle" id="lGridCasual">
+      <div class="tft-cockpit-3col">
+        <!-- Col Left (~25%): Engine Parameters C.TEMP + BATTERY -->
+        <div class="tft-col tft-col--left">
+          <!-- C.TEMP -->
+          <div class="tft-engine-item">
+            <div class="tft-bar-head">
+              <div class="tft-label-icon">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#00E5FF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0z"/></svg>
+                <span class="tft-label-text">C.TEMP</span>
+              </div>
+              <div class="tft-val-text"><span class="num num-cyan" id="lcEctNum">--</span><span class="unit">°C</span></div>
+            </div>
+            <div class="tft-gauge-bar"><div class="tft-gauge-fill fill-cyan" id="lcEctFill"></div></div>
+            <span id="lcEctSub" style="display:none;"></span>
+          </div>
+
+          <!-- BATTERY (Replaces FUEL, Live Voltage Bar) -->
+          <div class="tft-engine-item">
+            <div class="tft-bar-head">
+              <div class="tft-label-icon">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#00FF66" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="13" rx="2"/><path d="M6 7V4h3v3M15 7V4h3v3"/></svg>
+                <span class="tft-label-text">BATTERY</span>
+              </div>
+              <div class="tft-val-text"><span class="num num-green" id="lcBatNum">--</span><span class="unit">V</span></div>
+            </div>
+            <div class="tft-gauge-bar"><div class="tft-gauge-fill fill-green" id="lcBatFill"></div></div>
+            <span id="lcBatSub" style="display:none;"></span>
+          </div>
+
+          <!-- Secondary Telemetry (IAT / LOAD in clean English) -->
+          <div class="tft-engine-bottom">
+            <div class="tft-mini-chips">
+              <span>IAT: <b id="lcIatNum">--</b>°C</span>
+              <span>LOAD: <b id="lcMapWord">--</b></span>
+            </div>
+            <span id="lcFuelNum" style="display:none;">71</span>
+            <div id="lcFuelFill" style="display:none;"></div>
+            <span id="lcFuelSub" style="display:none;"></span>
+            <span id="lcMapSub" style="display:none;"></span>
+            <input type="hidden" id="lcTpsNum" value="0" />
+            <input type="hidden" id="lcTpsMax" value="Max 0%" />
+            <div id="lcTpsBgSweep" style="display:none;"></div>
+            <div id="lcTpsFill" style="display:none;"></div>
+          </div>
+        </div>
+
+        <!-- Col Center (~42%): Hero Speedometer with Glowing Cyan Halo (Thin Font) -->
+        <div class="tft-col tft-col--center">
+          <div class="tft-speedo-hero">
+            <div class="tft-speed-wrap">
+              <span class="tft-speed-num" id="lcSpeedNum">0</span>
+              <span class="tft-speed-unit">km/h</span>
+            </div>
+            <span id="lcVssPeak" style="display:none;"></span>
+            <span id="lcPeak" style="display:none;"></span>
+          </div>
+        </div>
+
+        <!-- Col Right (~33%): Clean Monospace Branding, Bare BT & Compact Unified Card -->
+        <div class="tft-col tft-col--right">
+          <!-- Top Header: Minimalist Text + Bare BT Icon -->
+          <div class="tft-brand-head">
+            <span class="tft-brand-title">hvu24.5</span>
+            <button type="button" class="btn btn--conn-badge" id="lBtnBt" title="Kết nối USB OTG / Bluetooth">
+              <span class="conn-icon-svg" id="lConnSvgWrap">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 7 10 10-5 5V2l5 5L7 17"/></svg>
+              </span>
+              <span class="bt-dot" id="lBtDot"></span>
+            </button>
+          </div>
+
+          <!-- Unified Info Card (Dark Blue #0B1622) -->
+          <div class="tft-info-unified-card">
+            <!-- Left Half: GEAR Indicator -->
+            <div class="tft-card-half-gear">
+              <span class="tft-gear-label">GEAR</span>
+              <div class="tft-gear-display">
+                <span class="tft-gear-digit is-neutral" id="lcGearVal">N</span>
+              </div>
+              <span id="lcGearSub" style="display:none;"></span>
+            </div>
+
+            <!-- Vertical Separator Line -->
+            <div class="tft-card-divider"></div>
+
+            <!-- Right Half: TIME / TRIP A / ODO (Stacked label on top, value below) -->
+            <div class="tft-card-half-trip">
+              <div class="tft-trip-cell cell-time">
+                <span class="trip-tag">TIME</span>
+                <span class="trip-val val-time" id="lcTimeTxt">--:--</span>
+              </div>
+              <div class="tft-trip-cell">
+                <span class="trip-tag">TRIP A</span>
+                <span class="trip-val"><span id="lcTripTxt">0.0</span> km</span>
+              </div>
+              <div class="tft-trip-cell">
+                <span class="trip-tag">ODO</span>
+                <span class="trip-val"><span id="lcOdoTxt">506</span> km</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Landscape Nerdy HUD (Hero RPM + TPS+Volt + INJ+Duty + IGN / 6-Col Sensor Strip) -->
+    <div class="lhud-nerdy is-idle" id="lGridNerdy" hidden>
+      <div class="lhud-hero-row lhud-hero-row--nerdy">
+        <div class="mcard lhud-card">
+          <div class="kv-row"><span class="card-title">RPM</span><span class="peak-badge">P <b id="lnPeak">--</b></span></div>
+          <div class="val-wrap"><span class="hero-num hero-num--hud-sm" id="lnRpm">--</span></div>
+        </div>
+        <div class="mcard lhud-card lhud-tps-card">
+          <div class="tps-bg-sweep" id="lnTpsBgSweep"></div>
+          <div class="kv-row"><span class="card-title">TPS</span><span class="nsub" id="lnTpsVolt">-- V</span></div>
+          <div class="val-wrap"><span class="num num--md" id="lnTpsNum">--</span><span class="unit unit--md">%</span></div>
+          <div class="tps-track tps-track--thin"><div class="tps-fill" id="lnTpsFill"></div></div>
+        </div>
+        <div class="mcard lhud-card">
+          <div class="kv-row"><span class="card-title">INJ</span><span class="nsub" id="lnDuty">--%</span></div>
+          <div class="val-wrap"><span class="num num--md" id="lnInjNum">--</span><span class="unit unit--md">ms</span></div>
+        </div>
+        <div class="mcard lhud-card">
+          <span class="card-title">IGN · BTDC</span>
+          <div class="val-wrap"><span class="num num--md" id="lnIgnNum">--</span><span class="unit unit--md">°</span></div>
+        </div>
+      </div>
+      <div class="lhud-sub-row lhud-sub-row--6">
+        <div class="mcard lhud-card"><span class="card-title">ECT</span><div class="val-wrap"><span class="num num--xs" id="lnEctNum">--</span><span class="unit unit--xs">°C</span></div><div class="sub-line" id="lnEctMax">Max --</div></div>
+        <div class="mcard lhud-card"><span class="card-title">VBAT</span><div class="val-wrap"><span class="num num--xs" id="lnBatNum">--</span><span class="unit unit--xs">V</span></div><div class="sub-line" id="lnBatMin">Đề --V</div></div>
+        <div class="mcard lhud-card"><span class="card-title">MAP</span><div class="val-wrap"><span class="num num--xs" id="lnMapNum">--</span><span class="unit unit--xs">kPa</span></div></div>
+        <div class="mcard lhud-card"><span class="card-title">AFR</span><div class="val-wrap"><span class="num num--xs" id="lnAfrNum">--</span><span class="unit unit--xs">:1</span></div></div>
+        <div class="mcard lhud-card"><span class="card-title">IACV</span><div class="val-wrap"><span class="num num--xs" id="lnIacvNum">--</span><span class="unit unit--xs">stp</span></div></div>
+        <div class="mcard lhud-card"><span class="card-title">IAT</span><div class="val-wrap"><span class="num num--xs" id="lnIatNum">--</span><span class="unit unit--xs">°C</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================= -->
+  <!-- QUICK FI DTC MODAL (Accessible from Landscape FI button)  -->
+  <!-- ========================================================= -->
+  <div class="modal-backdrop" id="fiModal" hidden>
+    <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="fiModalTitle">
+      <div class="modal-head">
+        <div>
+          <h2 id="fiModalTitle">Chẩn đoán đèn báo FI (DTC)</h2>
+          <p class="modal-sub" id="fiModalEcm">ECM ID: --</p>
+        </div>
+        <button type="button" class="btn btn--touch" id="btnCloseFiModal">Đóng</button>
+      </div>
+      <div class="row-actions">
+        <button type="button" class="btn btn--primary btn--touch" id="mBtnReadDtc">Đọc lỗi ECU</button>
+        <button type="button" class="btn btn--secondary btn--touch" id="mBtnClearDtc">Xóa lỗi</button>
+      </div>
+      <div class="dtc-list" id="mDtcList">
+        <div class="mcard">Chưa có dữ liệu lỗi. Bấm "Đọc lỗi ECU" khi đang kết nối Bluetooth với xe.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================= -->
+  <!-- BLUETOOTH MANAGER MODAL                                   -->
+  <!-- ========================================================= -->
+  <div class="modal-backdrop" id="btModal" hidden>
+    <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="btModalTitle">
+      <div class="modal-head">
+        <div>
+          <h2 id="btModalTitle">Kết nối Bluetooth ECU</h2>
+          <p class="modal-sub" id="btModalStatus">HC-05 / HC-06 / JDY-31 (SPP) · HM-10 / JDY-23 / ESP32 (BLE)</p>
+        </div>
+        <button type="button" class="btn btn--touch" id="btnCloseModal">Đóng</button>
+      </div>
+
+      <div class="usb-connect-card">
+        <div class="section-cap">KẾT NỐI USB-TO-TTL (CÁP OTG)</div>
+        <div class="usb-connect-row">
+          <div class="usb-info-col">
+            <div class="usb-title">Cắm module USB-to-TTL qua cổng OTG điện thoại</div>
+            <div class="usb-chips-sub" id="usbChipsSub">Tự động nhận CH340, CP2102, FTDI, CDC-ACM (115200 8N1)</div>
+            <div class="usb-diag-box" id="usbDiagBox" style="margin-top:6px; font-size:12px; color:#00E5FF; font-family:monospace; background:rgba(0,0,0,0.4); padding:6px 10px; border-radius:6px; border:1px solid #1E293B;">
+              Trạng thái: Đang kiểm tra cổng USB...
+            </div>
+          </div>
+          <div class="usb-btn-group">
+            <button type="button" class="btn btn--primary btn--touch" id="btnConnectUsb">Kết nối USB</button>
+            <button type="button" class="btn btn--secondary btn--touch" id="btnWakeupUsb" title="Gửi mã đánh thức STM32 K-Line">Kích hoạt ECU</button>
+            <button type="button" class="btn btn--secondary btn--touch" id="btnDisconnectUsb">Ngắt USB</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="row-actions">
+        <button type="button" class="btn btn--primary btn--touch" id="btnScanBt">Quét Bluetooth</button>
+        <button type="button" class="btn btn--secondary btn--touch" id="btnDisconnectBt">Ngắt kết nối</button>
+      </div>
+
+      <div class="dev-columns">
+        <div class="dev-section">
+          <div class="section-cap">CLASSIC SPP (ĐÃ GHÉP NỐI)</div>
+          <div class="dev-list" id="pairedList">
+            <div class="muted-note">Nhấn "Quét thiết bị" để tải HC-05 / HC-06 đã ghép nối.</div>
+          </div>
+        </div>
+        <div class="dev-section">
+          <div class="section-cap">BLUETOOTH LE (QUÉT XUNG QUANH)</div>
+          <div class="dev-list" id="bleList">
+            <div class="muted-note">Chưa quét thiết bị BLE.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="sample_frames.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

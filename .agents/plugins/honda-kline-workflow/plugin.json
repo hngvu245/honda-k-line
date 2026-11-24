@@ -1,0 +1,11 @@
+{
+  "name": "honda-kline-workflow",
+  "displayName": "Honda K-Line Workflow",
+  "version": "1.0.0",
+  "description": "Specialized agents, skills, and project rules for developing STM32 K-Line firmware, Python PC workbench, and Android USB/BT telemetry APK in honda_test.",
+  "suggestedPrompts": [
+    "Build and verify the STM32 firmware with Keil UV4 CLI",
+    "Sync a Keihin Table 11 formula or UI change between dashboard.py and Android WebUI",
+    "Analyze kline_debug.log for checksum drops, EMI glitches, or serial disconnects"
+  ]
+}
