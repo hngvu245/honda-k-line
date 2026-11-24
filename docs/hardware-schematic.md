@@ -1,6 +1,6 @@
 # Sơ Đồ Phần Cứng & Kết Nối Chuẩn (L9637D - STM32F103C8T6 - Buck - Bluetooth)
 
-Tài liệu kỹ thuật chuẩn hóa theo **Datasheet chính thức ST L9637D (Doc ID 1765 Rev 8)**, cấu hình chân `firmware/honda_test.ioc`, sơ đồ nguồn Buck độc lập và module Bluetooth + mạch điều khiển chân `SCS`.
+Tài liệu kỹ thuật chuẩn hóa theo **Datasheet chính thức ST L9637D (Doc ID 1765 Rev 8)**, cấu hình chân `firmware/stm32-legacy/honda_test.ioc`, sơ đồ nguồn Buck độc lập và module Bluetooth + mạch điều khiển chân `SCS`.
 
 ---
 
@@ -32,7 +32,7 @@ Nhìn từ trên xuống, đầu có chấm tròn / rãnh khuyết nằm phía t
 
 ## 2. Trở Treo (Pull-up Resistor)
 
-* **Firmware hiện tại:** Toàn bộ chân `USART1` (`PA9`, `PA10`) trong `firmware/Core/Src/stm32f1xx_hal_msp.c` và `main.c` đang cấu hình `GPIO_NOPULL`.
+* **Firmware hiện tại:** Chân `USART1` (`PA9`, `PA10`) trong `firmware/stm32-legacy/Core/Src/stm32f1xx_hal_msp.c` cấu hình `PA9 = GPIO_MODE_AF_OD` và `PA10 = GPIO_MODE_INPUT` (`GPIO_PULLUP`). Khi chạy `KLine_FastInit()` trong `main.c`, `PA9` chuyển tạm sang `GPIO_MODE_OUTPUT_OD`.
 * **Phía K-Line 12V (Bắt buộc):** Nối **1 điện trở 510 Ω (công suất 0.5W)** giữa **Chân 6 (`K`)** và **Chân 7 (`VS` +12V)**. Khi bật khóa xe và chưa truyền dữ liệu, đo giữa dây `K` và `GND` phải thấy điện áp nghỉ **~11.5V – 12.5V**.
 * **Phía Logic 5V/3.3V:** Với IC L9637D chân `1 (RX)` có thể hoạt động trực tiếp với `PA10` hoặc gắn thêm trở kéo nhẹ `4.7 kΩ – 10 kΩ` lên `+3.3V` để chống trôi khi rút dây.
 

@@ -32,7 +32,7 @@
 - `software/pc-dashboard/` — Dashboard Python Dual-Mode (`dashboard.py`) cùng tool CLI (`sniffer.py`, `read_rpm.py`).
 - `software/android-apk/` — Java Native Host (`src/com/kailc/hondakline/`), USB OTG filter (`res/xml/device_filter.xml`), WebUI (`assets/www/`), test (`test_app.js`) và `build_apk.ps1`.
 - `software/logs/` — Log ECU thật từ xe (`kline_debug.log` phục vụ Replay) và CSV xuất (`kline_telemetry.csv`).
-- `docs/` — Đặc tả giao thức (`kline-protocol.md`), sơ đồ phần cứng STM32/ESP32-C3, phân tích lỗi và kiểm toán.
+- `docs/` — Đặc tả giao thức (`kline-protocol.md`), sơ đồ phần cứng STM32/ESP32-C3 (`hardware-schematic*.md`) và hướng dẫn thao tác (`workflow.md`).
 - `skills/` — Kho `taste-skill` tham khảo giao diện.
 - `.agents/` — Antigravity plugin `honda-kline-workflow` (4 specialized subagents + 4 skills).
 - `.ai/` — Tài liệu ngữ cảnh, spec, trí nhớ dài hạn và checklist review/fix bug của agent.

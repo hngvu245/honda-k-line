@@ -1,7 +1,7 @@
 # MEMORY.md — Trạng Thái Dự Án & Quyết Định Kỹ Thuật
 
 > **Cập nhật lần cuối:** 2026-11-25  
-> **Nguồn sự thật chi tiết:** [.ai/memory/progress.md](file:///d:/kailc/save/honda_test/.ai/memory/progress.md), [.ai/memory/decisions.md](file:///d:/kailc/save/honda_test/.ai/memory/decisions.md), [.ai/memory/lessons.md](file:///d:/kailc/save/honda_test/.ai/memory/lessons.md)
+> **Nguồn sự thật chi tiết:** [.ai/memory/progress.md](.ai/memory/progress.md), [.ai/memory/decisions.md](.ai/memory/decisions.md), [.ai/memory/lessons.md](.ai/memory/lessons.md)
 
 ---
 

@@ -6,11 +6,11 @@ Tài liệu đặc tả giao thức chẩn đoán **Honda Keihin PGM-FI K-Line**
 
 ## 1. Quy Trình Bắt Tay (3-Step Handshake) & Giữ Thức ECU
 
-ECU Honda yêu cầu toàn bộ quá trình đánh thức và hỏi dữ liệu diễn ra trong vòng **dưới 2 giây (2000 ms)**, nếu quá thời gian ECU sẽ tự ngủ lại (Sleep mode). Firmware hiện tại giữ chu kỳ hỏi mỗi **300 ms**.
+ECU Honda yêu cầu toàn bộ quá trình đánh thức và hỏi dữ liệu diễn ra trong vòng **dưới 2 giây (2000 ms)**, nếu quá thời gian ECU sẽ tự ngủ lại (Sleep mode). Firmware tối giản hiện tại (`firmware/stm32-legacy/Core/Src/main.c`) giữ chu kỳ hỏi mỗi **~145–160 ms** (`POLL_REST_MS = 100U` + `HAL_Delay(45)`).
 
 | Giai đoạn | Hành động trên STM32 (`PA9` / `USART1`) | Dữ liệu gửi (Hex) | Phản hồi chuẩn từ ECU (Hex) |
 | :--- | :--- | :--- | :--- |
-| **1. Fast Init (Cứng)** | Tạm tắt UART1, chuyển `PA9` sang Output Push-Pull: kéo **LOW 70 ms** $\rightarrow$ **HIGH 120 ms** $\rightarrow$ bật lại USART1 @ `10400 bps` | *(Xung vật lý)* | *(ECU tỉnh dậy)* |
+| **1. Fast Init (Cứng)** | Tạm tắt UART1, chuyển `PA9` sang Output Open-Drain (`OUTPUT_OD`): kéo **LOW 70 ms** $\rightarrow$ **HIGH 120 ms** $\rightarrow$ bật lại USART1 @ `10400 bps` | *(Xung vật lý)* | *(ECU tỉnh dậy)* |
 | **2. Wake-up (Mềm)** | Gửi gói Wake-up | `FE 04 72 8C` | `0E 04 72 7C` |
 | **3. Initialise** | Gửi gói khởi tạo phiên | `72 05 00 F0 99` | `02 04 00 FA` |
 | **4. Query Loop** | Hỏi liên tục mỗi 300 ms (bảo đảm `< 2s`) | `72 05 71 11 07` | `02 19 71 11 ... [25 byte]` |
@@ -68,7 +68,7 @@ ECU Keihin xuất nhiều cảm biến theo từng **cặp đôi**: `[Điện á
 | **`23`** | `0x00`..`0xFF` | **Cảm biến Oxy (O2) & AFR ước tính** | `O2 = ecu[23] / 256.0` (V); `AFR ≈ clamp(16.2 - O2 * 3.8, 11.8, 16.5)` | **`0.00 – 1.00 V`** |
 | `24` | *(biến thiên)* | **Checksum Byte** | Bù tổng 25 byte $\equiv 0 \pmod{256}$ | Đảm bảo toàn vẹn gói tin |
 
-### Các bảng lệnh chẩn đoán mở rộng (hỗ trợ từ Firmware v2.0)
+### Các bảng lệnh chẩn đoán mở rộng (đã hỗ trợ parser trên PC/Android; chưa kích hoạt trong `main.c` bản tối giản hiện tại)
 * **`Table 00` (`72 05 71 00 18`):** Trả về mã phụ tùng `ECM ID`.
 * **`Table 73` (`72 05 71 73 A5`):** Đọc mã lỗi **hiện tại** (Current DTC).
 * **`Table 74` (`72 05 71 74 A4`):** Đọc mã lỗi **quá khứ** (Stored/Past DTC).

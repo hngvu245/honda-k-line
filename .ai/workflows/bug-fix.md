@@ -1,7 +1,7 @@
 # Quy Trình Xử Lý Bug (Bug-Fix Workflow)
 
 1. **Tái hiện Offline trước:**
-   - Với lỗi giải mã/UI: trích dòng hex lỗi từ [software/logs/kline_debug.log](file:///d:/kailc/save/honda_test/software/logs/kline_debug.log) hoặc dùng Replay Simulator của `dashboard.py` / Demo `sample_frames.js`.
+   - Với lỗi giải mã/UI: trích dòng hex lỗi từ `software/logs/kline_debug.log` (cục bộ) hoặc dùng Replay Simulator của `dashboard.py` / Demo `sample_frames.js`.
    - Với lỗi STM32 / kết nối thực tế: kiểm tra log xem là `MCU_BOOT:` (brownout/reset), méo bit do bugi (`00` hoặc sai checksum), spam `"Dang danh thuc"`, hay lỗi COM Windows (`PermissionError(13)` / `OSError(22)`).
 2. **Cô lập đúng tầng (Layer Isolation):**
    - **Tầng vật lý / L9637D:** Mất cả 5 byte echo `72 05 71 11 07` $\rightarrow$ kiểm tra 5V VCC, 12V VS, trở kéo `510 Ω`, dây `PA9/PA10`, Mass chung.

@@ -1,6 +1,6 @@
 # Quy Trình Phát Triển & Cải Thiện Workflow (Honda Keihin K-Line)
 
-Tài liệu chuẩn hóa quy trình làm việc giữa **Firmware (STM32 / KeilC)**, **Phần mềm (PC Python / Android APK)** và **Phần cứng thực tế trên xe**, giúp giảm thời gian thử đi thử lại ngoài xe và loại bỏ các lỗi kẹt cổng COM / nạp mạch. Xem thêm [AGENTS.md](file:///d:/kailc/save/honda_test/AGENTS.md) và [docs/codebase-audit-and-workflow.md](file:///d:/kailc/save/honda_test/docs/codebase-audit-and-workflow.md) để tra cứu hệ thống Agent/Skill tự động của workspace.
+Tài liệu chuẩn hóa quy trình làm việc giữa **Firmware (STM32 / KeilC)**, **Phần mềm (PC Python / Android APK)** và **Phần cứng thực tế trên xe**, giúp giảm thời gian thử đi thử lại ngoài xe và loại bỏ các lỗi kẹt cổng COM / nạp mạch. Quy chuẩn cho AI agent xem tại [AGENTS.md](../AGENTS.md).
 
 ---
 
@@ -33,7 +33,7 @@ honda_test/
 Thay vì mỗi lần sửa công thức giải mã hay giao diện lại phải dắt xe ra cắm dây nổ máy, hãy làm đúng theo chu trình khép kín dưới đây:
 
 ### Bước 1 — Thu mẫu thực địa 1 lần (Capture)
-* Cắm STM32 + L9637D + CH340 vào xe, chạy [test_stream.py](file:///d:/kailc/save/honda_test/software/test_stream.py) hoặc [dashboard.py](file:///d:/kailc/save/honda_test/software/pc-dashboard/dashboard.py).
+* Cắm STM32 + L9637D + CH340 vào xe, chạy [test_stream.py](../software/test_stream.py) hoặc [dashboard.py](../software/pc-dashboard/dashboard.py).
 * Quét đủ các trạng thái thực tế cần kiểm thử:
   1. Bật khóa điện (chưa đề máy) $\rightarrow$ vặn ga từ `0%` đến `100%` để lấy ngưỡng TPS đóng/mở.
   2. Nổ garanti cho đến khi nóng máy (quan sát ECT tăng dần).
@@ -58,14 +58,14 @@ Thay vì mỗi lần sửa công thức giải mã hay giao diện lại phải 
   node "software/android-apk/test_app.js"
   powershell -ExecutionPolicy Bypass -File "d:\kailc\save\honda_test\software\android-apk\build_apk.ps1"
   ```
-* Chép [honda-kline-racing.apk](file:///d:/kailc/save/honda_test/software/android-apk/honda-kline-racing.apk) vào điện thoại và bấm **Demo** để test bố cục dọc/ngang trực tiếp trước khi ra xe.
+* Chép `software/android-apk/honda-kline-racing.apk` (hoặc tải từ GitHub Releases) vào điện thoại và bấm **Demo** để test bố cục dọc/ngang trực tiếp trước khi ra xe.
 
 ### Bước 4 — Nạp Firmware STM32 & Kiểm tra trên xe (Pre-Flight Checklist)
 Trước khi bấm **Download (F8)** trên KeilC và cắm lên xe thật, kiểm tra đủ 4 mục sau:
 1. **Giải phóng cổng COM & mạch nạp:** Tắt hết `dashboard.py`, `sniffer.py`, `test_stream.py` đang chạy ngầm trước khi build/nạp.
-2. **Kiểm tra chế độ SWD/EMI trong `stm32f1xx_hal_msp.c`:** `__HAL_AFIO_REMAP_SWJ_NOJTAG()` dùng để nạp ST-Link trên bàn; khi chạy thử trên xe gặp xung cao áp bugi gây treo MCU, cân nhắc chuyển sang `__HAL_AFIO_REMAP_SWJ_DISABLE()` (chi tiết tại [plan.md](file:///d:/kailc/save/honda_test/plan.md)).
+2. **Kiểm tra chế độ SWD/EMI trong `stm32f1xx_hal_msp.c`:** `__HAL_AFIO_REMAP_SWJ_NOJTAG()` dùng để nạp ST-Link trên bàn; khi chạy thử trên xe gặp xung cao áp bugi gây treo MCU, cân nhắc chuyển sang `__HAL_AFIO_REMAP_SWJ_DISABLE()` (chi tiết tại [lessons.md](../.ai/memory/lessons.md)).
 3. **Đo nguồn Buck (khi dùng độc lập trên xe):** Chỉnh đầu ra Buck (MP1584/LM2596) đúng **`5.0V`** trước khi cấp vào STM32 `5V`, L9637D `Pin 3 (VCC)` và module Bluetooth.
-4. **Kiểm tra Baudrate Bluetooth & an toàn 12V:** Module Bluetooth phải set **`115200 bps`** khớp `USART2` trong [main.c](file:///d:/kailc/save/honda_test/firmware/stm32-legacy/Core/Src/main.c) (`huart2.Init.BaudRate = 115200`); đường `+12V` phải qua cầu chì + diode `1N5819` và nối chung `GND` trước.
+4. **Kiểm tra Baudrate Bluetooth & an toàn 12V:** Module Bluetooth phải set **`115200 bps`** khớp `USART2` trong [main.c](../firmware/stm32-legacy/Core/Src/main.c) (`huart2.Init.BaudRate = 115200`); đường `+12V` phải qua cầu chì + diode `1N5819` và nối chung `GND` trước.
 
 ---
 
@@ -108,7 +108,7 @@ Chạy từ thư mục gốc `d:\kailc\save\honda_test`:
 
 ### Lỗi 4: Bluetooth kết nối báo "Đã kết nối" nhưng màn hình đứng im ở `0 RPM`
 * **Nguyên nhân:** Module Bluetooth mặc định chạy `9600 bps`, trong khi `USART2` trên STM32 xuất ra `115200 bps`.
-* **Cách xử lý:** Cắm module Bluetooth qua mạch CH340, gửi lệnh AT đổi Baudrate về **`115200`** (chi tiết lệnh xem tại [software/android-apk/README.md](file:///d:/kailc/save/honda_test/software/android-apk/README.md)).
+* **Cách xử lý:** Cắm module Bluetooth qua mạch CH340, gửi lệnh AT đổi Baudrate về **`115200`** (chi tiết lệnh xem tại [software/android-apk/README.md](../software/android-apk/README.md)).
 
 ---
 
