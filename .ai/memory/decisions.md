@@ -10,7 +10,7 @@
 - **Quyết định:** Mọi thay đổi UI/decoder phải test trước qua `software/logs/kline_debug.log` (PC) và `sample_frames.js` + `test_app.js` (Android). Build APK chạy script `build_apk.ps1` trỏ toàn bộ cache vào `D:\kailc\.android-toolchain`.
 - **Hệ quả:** Rút ngắn vòng lặp kiểm thử UI xuống vài giây; khi chạy `apksigner.bat` độc lập cần set `$env:JAVA_HOME='D:\kailc\.android-toolchain\jdk'`.
 
-## ADR-003: Đồng bộ Giao diện 2.2:1 TFT Motorsport & Virtual Gear Estimator
-- **Bối cảnh:** Xe Honda phổ thông truyền speed `VSS` và `RPM` qua K-Line Table `11` nhưng không xuất trực tiếp byte số hộp số trên mọi đời ECU.
-- **Quyết định:** Tính cấp số ảo từ tỷ số $R = \text{RPM} / \text{VSS}$ kèm debounce 3 khung hình ở cả `dashboard.py` (`calculate_gear`) và `app.js` (`calculateGear`), chia chung preset `winner150`, `wave110`, `exciter150`.
-- **Hệ quả:** Không cần đấu thêm dây cảm biến số; mọi thay đổi bảng tỷ số phải cập nhật song song ở cả Python, JS và `test_app.js`.
+## ADR-003: Đồng bộ Giao diện TFT Motorsport, Virtual Gear v2 & Tự Học Số Không Preset
+- **Bối cảnh:** Xe Honda phổ thông không xuất byte số hộp số qua K-Line Table `11`; các tỷ số đặt sẵn theo dòng xe dễ sai khác theo nhông sên dĩa thực tế, đồng thời `VSS` là số nguyên làm nhảy số ảo ở tốc độ thấp.
+- **Quyết định:** Bỏ menu preset xe; xây dựng lõi chung `KlineCore` (`software/android-apk/assets/www/kline_core.js`) hỗ trợ **Học Số 1 (Kéo Max Tua)** dùng Trimmed Median (MAD) + suy ra tạm số `2..6`, **Tự Học 1→6** và **Chỉnh lẻ từng số**; dùng ranh giới Voronoi trung bình nhân ($\sqrt{R_i \cdot R_{i+1}}$), bù lượng tử `VSS ± 0.7 km/h` và **Clutch-In Freeze** đồng bộ sang `calculate_gear()` của `dashboard.py`. Thêm `dev_server.py` trong `software/android-apk/` để debug WebUI & cài APK qua Wi-Fi mà không cần nạp đi nạp lại.
+- **Hệ quả:** Mọi xe nhông sên dĩa bất kỳ chỉ cần 1 cú kéo số 1 là hiển thị số chính xác; `test_app.js` import trực tiếp `KlineCore` thay cho mã giả lập.

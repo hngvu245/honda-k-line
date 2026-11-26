@@ -14,10 +14,15 @@ import android.bluetooth.BluetoothSocket;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
 import android.widget.Toast;
@@ -27,12 +32,18 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 
@@ -51,6 +62,9 @@ public class BtBridge {
     private final BluetoothAdapter adapter;
 
     private volatile boolean sppRunning = false;
+    private volatile long connectSessionId = 0;
+    private volatile String activeTransport = "NONE";
+    private final ArrayDeque<String> debugLogs = new ArrayDeque<>();
     private BluetoothSocket sppSocket;
     private OutputStream sppOut;
     private Thread sppThread;
@@ -92,8 +106,33 @@ public class BtBridge {
     }
 
     private void emitStatus(String state, String message) {
+        logDebug("NATIVE_" + String.valueOf(state).toUpperCase(Locale.US), String.valueOf(message));
         evalJs("window.__onBtStatus && window.__onBtStatus("
             + JSONObject.quote(state) + ", " + JSONObject.quote(message) + ");");
+    }
+
+    @JavascriptInterface
+    public void logDebug(String level, String message) {
+        String ts = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+        String line = "[" + ts + "] [" + (level != null ? level : "INFO") + "] " + (message != null ? message : "");
+        synchronized (debugLogs) {
+            debugLogs.addLast(line);
+            while (debugLogs.size() > 160) {
+                debugLogs.removeFirst();
+            }
+        }
+    }
+
+    @JavascriptInterface
+    public String getAppDebugLogs() {
+        synchronized (debugLogs) {
+            StringBuilder sb = new StringBuilder();
+            for (String s : debugLogs) {
+                if (sb.length() > 0) sb.append('\n');
+                sb.append(s);
+            }
+            return sb.toString();
+        }
     }
 
     @JavascriptInterface
@@ -203,6 +242,8 @@ public class BtBridge {
         }
         disconnect();
         stopBleScan();
+        final long mySession = ++connectSessionId;
+        activeTransport = "SPP";
         emitStatus("connecting", "Đang kết nối SPP " + mac + "...");
 
         sppRunning = true;
@@ -220,6 +261,11 @@ public class BtBridge {
                     sock.connect();
                 }
 
+                if (connectSessionId != mySession) {
+                    try { sock.close(); } catch (Exception ignored) {}
+                    return;
+                }
+
                 sppSocket = sock;
                 sppOut = sock.getOutputStream();
                 InputStream in = sock.getInputStream();
@@ -234,7 +280,7 @@ public class BtBridge {
                 } catch (Exception ignored) {}
 
                 byte[] buf = new byte[512];
-                while (sppRunning) {
+                while (sppRunning && connectSessionId == mySession) {
                     int n = in.read(buf);
                     if (n < 0) break;
                     if (n > 0) {
@@ -242,15 +288,18 @@ public class BtBridge {
                     }
                 }
             } catch (Exception e) {
-                if (sppRunning) {
+                if (sppRunning && connectSessionId == mySession) {
                     emitStatus("error", "Mất kết nối SPP: " + e.getMessage());
                 }
             } finally {
                 sppRunning = false;
                 try { if (sock != null) sock.close(); } catch (Exception ignored) {}
-                sppSocket = null;
-                sppOut = null;
-                emitStatus("disconnected", "Đã ngắt kết nối");
+                if (connectSessionId == mySession) {
+                    sppSocket = null;
+                    sppOut = null;
+                    if ("SPP".equals(activeTransport)) activeTransport = "NONE";
+                    emitStatus("disconnected", "Đã ngắt kết nối SPP");
+                }
             }
         }, "BtSppReader");
         sppThread.start();
@@ -265,6 +314,8 @@ public class BtBridge {
         }
         disconnect();
         stopBleScan();
+        final long mySession = ++connectSessionId;
+        activeTransport = "BLE";
         emitStatus("connecting", "Đang kết nối BLE " + mac + "...");
 
         try {
@@ -275,12 +326,14 @@ public class BtBridge {
             gatt = dev.connectGatt(activity, false, new BluetoothGattCallback() {
                 @Override
                 public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
+                    if (connectSessionId != mySession) return;
                     if (newState == BluetoothProfile.STATE_CONNECTED) {
                         emitStatus("connecting", "Đang đồng bộ GATT...");
                         try { g.requestMtu(185); } catch (Exception ignored) {}
                         g.discoverServices();
                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                         bleWriteChar = null;
+                        if ("BLE".equals(activeTransport)) activeTransport = "NONE";
                         emitStatus("disconnected", "Đã ngắt kết nối BLE");
                     }
                 }
@@ -383,10 +436,13 @@ public class BtBridge {
     public void send(String text) {
         if (text == null) return;
         byte[] payload = text.getBytes(StandardCharsets.US_ASCII);
-        if (usbSerialManager != null) {
-            usbSerialManager.write(payload);
+        if ("USB".equals(activeTransport)) {
+            if (usbSerialManager != null && usbSerialManager.isConnected()) {
+                usbSerialManager.write(payload);
+            }
+            return;
         }
-        if (sppOut != null) {
+        if ("SPP".equals(activeTransport) && sppOut != null) {
             new Thread(() -> {
                 try {
                     sppOut.write(payload);
@@ -395,7 +451,7 @@ public class BtBridge {
             }).start();
             return;
         }
-        if (gatt != null && bleWriteChar != null) {
+        if ("BLE".equals(activeTransport) && gatt != null && bleWriteChar != null) {
             try {
                 int writeType = (bleWriteChar.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
                     ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -481,6 +537,8 @@ public class BtBridge {
     @SuppressLint("MissingPermission")
     @JavascriptInterface
     public void disconnect() {
+        connectSessionId++;
+        activeTransport = "NONE";
         sppRunning = false;
         if (sppSocket != null) {
             try { sppSocket.close(); } catch (Exception ignored) {}
@@ -500,6 +558,8 @@ public class BtBridge {
     @JavascriptInterface
     public void connectUsb() {
         disconnect();
+        connectSessionId++;
+        activeTransport = "USB";
         if (usbSerialManager != null) {
             usbSerialManager.connectFirstAvailable();
         }
@@ -507,6 +567,8 @@ public class BtBridge {
 
     public void connectUsbDevice(android.hardware.usb.UsbDevice device) {
         disconnect();
+        connectSessionId++;
+        activeTransport = "USB";
         if (usbSerialManager != null && device != null) {
             usbSerialManager.requestPermissionAndConnect(device);
         }
@@ -522,9 +584,12 @@ public class BtBridge {
 
     @JavascriptInterface
     public void disconnectUsb() {
+        connectSessionId++;
+        if ("USB".equals(activeTransport)) activeTransport = "NONE";
         if (usbSerialManager != null) {
             usbSerialManager.closeConnection();
         }
+        emitStatus("disconnected", "Đã ngắt USB OTG");
     }
 
     @JavascriptInterface
@@ -548,24 +613,145 @@ public class BtBridge {
         return "{\"hasDevice\":false,\"isConnected\":false}";
     }
 
+    private File getSessionDir() {
+        File dir = activity.getExternalFilesDir(null);
+        if (dir == null) {
+            dir = activity.getFilesDir();
+        }
+        if (dir != null && !dir.exists()) {
+            dir.mkdirs();
+        }
+        return dir;
+    }
+
+    private String sanitizeFileName(String filename) {
+        if (filename == null || filename.trim().isEmpty()) {
+            return "kline_session.csv";
+        }
+        return filename.trim().replaceAll("[^a-zA-Z0-9._-]", "_");
+    }
+
     @JavascriptInterface
     public String saveSessionCsv(String filename, String csvContent) {
         try {
-            File dir = activity.getExternalFilesDir(null);
-            if (dir == null) {
-                dir = activity.getFilesDir();
-            }
-            String safeName = (filename == null || filename.trim().isEmpty())
-                ? "kline_session.csv"
-                : filename.replaceAll("[^a-zA-Z0-9._-]", "_");
+            File dir = getSessionDir();
+            String safeName = sanitizeFileName(filename);
             File outFile = new File(dir, safeName);
             try (FileOutputStream fos = new FileOutputStream(outFile)) {
                 fos.write((csvContent != null ? csvContent : "").getBytes(StandardCharsets.UTF_8));
             }
             String savedPath = outFile.getAbsolutePath();
-            mainHandler.post(() -> Toast.makeText(activity, "Đã lưu log: " + safeName, Toast.LENGTH_SHORT).show());
+            mainHandler.post(() -> Toast.makeText(activity, "Đã lưu file: " + safeName, Toast.LENGTH_SHORT).show());
             return savedPath;
         } catch (Exception e) {
+            return "ERROR: " + e.getMessage();
+        }
+    }
+
+    @JavascriptInterface
+    public String listSessionFiles() {
+        JSONArray arr = new JSONArray();
+        try {
+            File dir = getSessionDir();
+            File[] files = (dir != null) ? dir.listFiles() : null;
+            if (files == null) return "[]";
+            Arrays.sort(files, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+            for (File f : files) {
+                if (!f.isFile()) continue;
+                String name = f.getName();
+                String lower = name.toLowerCase(Locale.US);
+                if (!lower.endsWith(".csv") && !lower.endsWith(".log") && !lower.endsWith(".txt")) continue;
+                JSONObject obj = new JSONObject();
+                obj.put("name", name);
+                obj.put("sizeBytes", f.length());
+                obj.put("modifiedMs", f.lastModified());
+                obj.put("kind", lower.endsWith(".csv") ? "rec" : "log");
+                arr.put(obj);
+            }
+        } catch (Exception e) {
+            logDebug("FILE_LIST_ERR", e.getMessage());
+        }
+        return arr.toString();
+    }
+
+    @JavascriptInterface
+    public String readSessionFile(String filename) {
+        try {
+            File dir = getSessionDir();
+            String safeName = sanitizeFileName(filename);
+            File target = new File(dir, safeName);
+            if (!target.exists() || !target.isFile()) return "";
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            try (FileInputStream fis = new FileInputStream(target)) {
+                int n;
+                while ((n = fis.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+            }
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            logDebug("FILE_READ_ERR", e.getMessage());
+            return "";
+        }
+    }
+
+    @JavascriptInterface
+    public boolean deleteSessionFile(String filename) {
+        try {
+            File dir = getSessionDir();
+            String safeName = sanitizeFileName(filename);
+            File target = new File(dir, safeName);
+            return target.exists() && target.isFile() && target.delete();
+        } catch (Exception e) {
+            logDebug("FILE_DEL_ERR", e.getMessage());
+            return false;
+        }
+    }
+
+    @JavascriptInterface
+    public String exportSessionToDownloads(String filename) {
+        try {
+            File dir = getSessionDir();
+            String safeName = sanitizeFileName(filename);
+            File src = new File(dir, safeName);
+            if (!src.exists() || !src.isFile()) return "ERROR: Không tìm thấy file";
+            String mime = safeName.toLowerCase(Locale.US).endsWith(".csv") ? "text/csv" : "text/plain";
+            byte[] buf = new byte[4096];
+
+            if (Build.VERSION.SDK_INT >= 29) {
+                ContentResolver cr = activity.getContentResolver();
+                ContentValues cv = new ContentValues();
+                cv.put(MediaStore.Downloads.DISPLAY_NAME, safeName);
+                cv.put(MediaStore.Downloads.MIME_TYPE, mime);
+                cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/HondaKline");
+                Uri uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                if (uri == null) return "ERROR: Không tạo được file trong Downloads";
+                try (FileInputStream fis = new FileInputStream(src);
+                     OutputStream os = cr.openOutputStream(uri)) {
+                    if (os == null) return "ERROR: Không mở được luồng ghi Downloads";
+                    int n;
+                    while ((n = fis.read(buf)) > 0) {
+                        os.write(buf, 0, n);
+                    }
+                }
+            } else {
+                File dlRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                File dlDir = new File(dlRoot, "HondaKline");
+                if (!dlDir.exists()) dlDir.mkdirs();
+                File dst = new File(dlDir, safeName);
+                try (FileInputStream fis = new FileInputStream(src);
+                     FileOutputStream fos = new FileOutputStream(dst)) {
+                    int n;
+                    while ((n = fis.read(buf)) > 0) {
+                        fos.write(buf, 0, n);
+                    }
+                }
+            }
+            mainHandler.post(() -> Toast.makeText(activity, "Đã xuất Downloads/HondaKline/" + safeName, Toast.LENGTH_SHORT).show());
+            return "Downloads/HondaKline/" + safeName;
+        } catch (Exception e) {
+            logDebug("EXPORT_ERR", e.getMessage());
             return "ERROR: " + e.getMessage();
         }
     }

@@ -65,6 +65,8 @@
 - `HAL_UART_ErrorCallback()` luôn phải đọc `SR` $\rightarrow$ `DR`, xóa đủ cờ `ORE/FE/NE` và reset `RxState` trước khi re-arm `HAL_UART_Receive_IT()`.
 - Luôn chạy `Stop-Process -Name python -Force` trước khi nạp Keil/mở COM mới, và dùng pin laptop (rút sạc AC) khi cắm vào xe tránh ground loop CH340.
 - `res/xml/device_filter.xml` dùng hệ thập phân (`0x4348` = `17224`, không ghi `4348`); chạy `apksigner.bat` độc lập phải set `$env:JAVA_HOME='D:\kailc\.android-toolchain\jdk'`.
+- `KlineCore.parseKlinePacket()` trả về `afrEst` dạng chuỗi (`"CUT"`/`"--"`/`"14.2"`), không gọi `.toFixed()`; kiểm tra USB connection phải parse JSON `getUsbDebugInfo().isConnected` (tránh `.includes("connected")` trúng chuỗi `"isConnected":false`).
+- Khế ước callback từ `BtBridge.java` xuống WebUI là `window.__onBtFrame`, `window.__onBtStatus`, `window.__onPairedDevices`, `window.__onBleDeviceFound`, `window.__onBleScanDone` — luôn giữ alias khớp tên khi sửa `app.js` và kiểm tra bằng `test_app.js`.
 
 ## 6. Điều hướng tài liệu (Context Routing)
 Chỉ đọc các file dưới đây khi task có liên quan để tiết kiệm context:

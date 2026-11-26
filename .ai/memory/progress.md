@@ -6,9 +6,9 @@
 
 | Module | Phiên bản / Trạng thái | Kết quả kiểm chứng gần nhất |
 | :--- | :--- | :--- |
-| **STM32 Firmware** (`firmware/stm32-legacy/`) | Bản tối giản ổn định (`main.c` 294 dòng, `SWJ_NOJTAG` đang bật) | `UV4.exe -b` ngày 2026-11-25: `0 Error(s), 0 Warning(s)`, xuất `honda_test.hex` |
-| **PC Dashboard** (`software/pc-dashboard/dashboard.py`) | Dual-mode `NERDY` + `CASUAL`, Replay + CSV + Gear | `python -m py_compile` pass (Python `3.14.5`, `customtkinter 6.0.0`, `pyserial 3.5`) |
-| **Android APK** (`software/android-apk/`) | `v3.2` (`versionCode 15`, `honda-kline-racing.apk` `349.8 KB`) | `node --check`, `test_app.js` (`183` DOM IDs, `410` frames, `7/7` gear PASS), `apksigner` v2/v3 verified |
+| **STM32 Firmware** (`firmware/stm32-legacy/`) | Đã nâng cấp `main.c` (DTC/ECMID/PROBE + `KLine_WaitResponse` + `IWDG` 2s, `SWJ_NOJTAG`) | `UV4.exe -b` exit `0`, xuất `honda_test.hex` |
+| **PC Dashboard** (`software/pc-dashboard/dashboard.py`) | Dual-mode `NERDY` + `CASUAL`, Replay + CSV + Virtual Gear v3 (Voronoi + Anti-Coasting) | `python -B -m py_compile` pass (Python `3.14.5`, `customtkinter 6.0.0`, `pyserial 3.5`) |
+| **Android APK** (`software/android-apk/`) | `v3.2` (`versionCode 15`, `honda-kline-racing.apk` `345.9 KB`), Virtual Gear v3 + Pull-Learn G1 + Hộp Đen REC | `node --check`, `test_app.js` (`12/12` PASS), `apksigner` v2/v3 verified |
 | **ESP32-C3** | Chỉ có tài liệu thiết kế (`docs/*esp32c3*`) | Chưa có mã nguồn firmware |
 | **Hệ thống Agent / Docs** | Đã chuẩn hóa `AGENTS.md`, `PLAN.md`, `MEMORY.md`, `.ai/`, `.agents/plugins/honda-kline-workflow/` | Đã dọn 29 file rác forensic & đồng bộ tài liệu |
 

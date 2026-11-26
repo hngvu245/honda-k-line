@@ -6,10 +6,10 @@
 ---
 
 ## 1. Trạng thái hiện tại (Current State)
-- **Firmware STM32 (`firmware/stm32-legacy/`):** Đang ở bản tối giản ổn định (`main.c` 294 dòng: Fast-Init 70/120ms lúc boot + lệnh `WAKEUP`, poll Table `11` mỗi `POLL_REST_MS=100` + `HAL_Delay(45)`). Build Keil CLI mới nhất `0 Error(s), 0 Warning(s)`.
+- **Firmware STM32 (`firmware/stm32-legacy/`):** Đã nâng cấp [main.c](firmware/stm32-legacy/Core/Src/main.c): giữ nguyên Fast-Init an toàn (không tự giật trong `while(1)`), thêm lệnh `DTC`/`CLEARDTC`/`ECMID`/`PROBE <HEX>` qua `USART2`, `KLine_WaitResponse` đọc độ dài thực `len` (max `65ms`, lọc Echo rác), và `IWDG` ~2s chống treo. Build Keil `UV4.exe -b` exit `0`.
 - **Cảnh báo phần cứng đang mở:** `stm32f1xx_hal_msp.c` đang bật `__HAL_AFIO_REMAP_SWJ_NOJTAG()` (mở SWD `PA13`/`PA14` để nạp ST-Link). Chưa kiểm chứng lại trên xe nổ máy xem có cần chuyển về `__HAL_AFIO_REMAP_SWJ_DISABLE()` hay không.
-- **PC Dashboard (`software/pc-dashboard/dashboard.py`):** Hoàn chỉnh 2 chế độ (`NERDY (Bench)` & `CASUAL`), Replay từ `software/logs/kline_debug.log`, xuất CSV và Virtual Gear.
-- **Android APK (`software/android-apk/honda-kline-racing.apk`):** `v3.2` (`versionCode 15`, `349.8 KB`), đã sửa lỗi đóng thẻ `</div>` dư quanh `#lGridNerdy` trong `index.html` và lỗi VID thập phân Qinheng (`17224`) trong `device_filter.xml`; `test_app.js` pass (`183` DOM IDs, `410` sample frames, `7/7` gear tests), chữ ký v2/v3 verified.
+- **PC Dashboard (`software/pc-dashboard/dashboard.py`):** Hoàn chỉnh 2 chế độ (`NERDY (Bench)` & `CASUAL`), Replay từ `software/logs/kline_debug.log`, xuất CSV và Virtual Gear v3 (Voronoi, bù `VSS ±0.7`, chống nhảy số khi âm côn bằng `TPS + INJ + adaptive idleRpm`, giữ nguyên giao diện PC).
+- **Android APK (`software/android-apk/honda-kline-racing.apk`):** `v3.2` (`versionCode 15`, `345.9 KB`), logo mới, giao diện Obsidian Carbon TFT 60fps, Virtual Gear v3 chống nhảy số khi âm côn + Pull-Learn Số 1, Hộp Đen REC Replay CSV, font tiếng Việt chuẩn. Kiểm thử `test_app.js` (`12/12` PASS), chữ ký `v2+v3` verified.
 - **ESP32-C3:** Mới có tài liệu thiết kế sơ đồ & pinout trong `docs/`, **chưa có mã nguồn firmware**.
 
 ## 2. Việc còn dở dang / Bước tiếp theo

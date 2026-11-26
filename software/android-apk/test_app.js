@@ -1,167 +1,223 @@
-const fs = require('fs');
-const path = require('path');
+const fs = require("fs");
+const path = require("path");
+const assert = require("assert");
+const vm = require("vm");
 
-const html = fs.readFileSync(path.join(__dirname, 'assets/www/index.html'), 'utf8');
-const js = fs.readFileSync(path.join(__dirname, 'assets/www/app.js'), 'utf8');
+const wwwDir = path.join(__dirname, "assets", "www");
+const html = fs.readFileSync(path.join(wwwDir, "index.html"), "utf8");
+const css = fs.readFileSync(path.join(wwwDir, "app.css"), "utf8");
+const js = fs.readFileSync(path.join(wwwDir, "app.js"), "utf8");
+const core = require(path.join(wwwDir, "kline_core.js"));
 
-// Regex for $("someId") or $('someId')
-const idRegex = /\$\(["']([a-zA-Z0-9_\-]+)["']\)/g;
-let m;
-const used = new Set();
-while ((m = idRegex.exec(js)) !== null) {
-  used.add(m[1]);
+let passed = 0;
+function check(name, fn) {
+  try {
+    fn();
+    console.log("  [PASS]", name);
+    passed += 1;
+  } catch (err) {
+    console.error("  [FAIL]", name, "-", err.message);
+    process.exitCode = 1;
+  }
 }
 
-const missing = [...used].filter(id => !html.includes(`id="${id}"`) && !html.includes(`id='${id}'`));
-console.log('Checked DOM IDs in app.js:', used.size);
-if (missing.length > 0) {
-  console.error('Missing IDs in index.html:', missing);
-  process.exit(1);
-} else {
-  console.log('ALL DOM IDs MATCH PERFECTLY!');
-}
+console.log("=== 1. DOM & Asset Integrity ===");
 
-// Extract parseKlinePacket and calculateGear for standalone test
-global.window = {};
-const sampleFrames = require('./assets/www/sample_frames.js');
-const frames = window.SAMPLE_FRAMES || [];
-
-const GEAR_PRESETS = {
-  winner150: {
-    name: "Honda Winner X / CBR150 (6 số)",
-    gears: 6,
-    ratios: [160.8, 107.5, 78.2, 62.6, 54.1, 47.4],
-    tolerance: 0.10
+check("HTML has zero duplicate id attributes", () => {
+  const idCounts = new Map();
+  const re = /\bid\s*=\s*"([^"]+)"/g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    idCounts.set(m[1], (idCounts.get(m[1]) || 0) + 1);
   }
-};
+  const dups = [...idCounts.entries()].filter(([, c]) => c > 1);
+  assert.deepStrictEqual(dups, [], "Duplicate IDs: " + JSON.stringify(dups));
+});
 
-let gearState = {
-  current: "N",
-  candidate: "N",
-  confidence: 0,
-  lastShiftTs: 0
-};
+check("Every $('id') reference in app.js exists in index.html", () => {
+  const idSet = new Set();
+  const idRe = /\bid\s*=\s*"([^"]+)"/g;
+  let m;
+  while ((m = idRe.exec(html)) !== null) idSet.add(m[1]);
 
-function calculateGear(rpm, vss, now = Date.now()) {
-  if (!rpm || rpm < 350) {
-    gearState.current = "--";
-    return "--";
+  const refRe = /\$\(\s*"([^"]+)"\s*\)/g;
+  const missing = [];
+  while ((m = refRe.exec(js)) !== null) {
+    if (!idSet.has(m[1])) missing.push(m[1]);
   }
-  if (!vss || vss < 2) {
-    gearState.current = "N";
-    gearState.candidate = "N";
-    gearState.confidence = 0;
-    return "N";
+  assert.deepStrictEqual([...new Set(missing)], [], "Missing HTML IDs: " + missing.join(", "));
+});
+
+check("index.html loads kline_core.js before app.js and omits bike presets", () => {
+  const corePos = html.indexOf("kline_core.js");
+  const appPos = html.indexOf("app.js");
+  assert(corePos !== -1 && appPos !== -1 && corePos < appPos, "kline_core.js must load before app.js");
+  assert(!html.includes("gearBikePreset"), "No static bike preset selector allowed");
+});
+
+check("CSS resolves landscape conflict, keeps bottom touch toolbar, and loads Vietnamese 400-700 fonts", () => {
+  const fontsCss = fs.readFileSync(path.join(wwwDir, "fonts.css"), "utf8");
+  assert(!css.includes("max-height: 540px"), "Legacy 540px split breakpoint must not return");
+  assert(css.includes("@media (orientation: landscape)"), "Landscape media query required");
+  assert(css.includes(".lhud-toolbar {\n    position: fixed;\n    bottom: 10px;") ||
+         css.includes(".lhud-toolbar {\r\n    position: fixed;\r\n    bottom: 10px;"),
+         "Landscape toolbar must dock at bottom so it never blocks top replay bar");
+  assert(fontsCss.includes("font-weight: 400;") && fontsCss.includes("barlow_0_vietnamese.woff2"),
+         "Barlow Vietnamese 400 weight alias must exist");
+});
+
+check("Every window.__on* callback called by BtBridge.java is handled in app.js", () => {
+  const bridgeJava = fs.readFileSync(path.join(__dirname, "src", "com", "kailc", "hondakline", "BtBridge.java"), "utf8");
+  const cbRe = /window\.(__on\w+)/g;
+  const missing = [];
+  let m;
+  while ((m = cbRe.exec(bridgeJava)) !== null) {
+    if (!js.includes(m[1])) missing.push(m[1]);
   }
+  assert.deepStrictEqual([...new Set(missing)], [], "Missing JS bridge callbacks: " + missing.join(", "));
+});
 
-  const r = rpm / vss;
-  const cfg = GEAR_PRESETS.winner150;
-  const ratios = cfg.ratios;
+console.log("=== 2. KlineCore Parser & Real Log Validation ===");
 
-  let matched = null;
-  let minErr = Infinity;
-  for (let i = 0; i < ratios.length; i++) {
-    const target = ratios[i];
-    const err = Math.abs(r - target) / target;
-    if (err < cfg.tolerance && err < minErr) {
-      minErr = err;
-      matched = String(i + 1);
+check("parseKlinePacket parses real Table 11 frame + rejects bad checksum", () => {
+  const good = "02 19 71 11 06 4C 17 00 45 64 7D 4B 89 5D FF FF 89 00 02 95 8E 2C 14 A7 10";
+  const pkt = core.parseKlinePacket(good);
+  assert(pkt && pkt.kind === "table11");
+  assert.strictEqual(pkt.rpm, 1612);
+  assert.strictEqual(pkt.ectC, 60);
+
+  const prefixed = core.parseKlinePacket("0x02 0x19 0x71 0x11 0x06 0x4C 0x17 0x00 0x45 0x64 0x7D 0x4B 0x89 0x5D 0xFF 0xFF 0x89 0x00 0x02 0x95 0x8E 0x2C 0x14 0xA7 0x10");
+  assert(prefixed && prefixed.rpm === 1612);
+
+  const badCs = "02 19 71 11 06 4C 17 00 45 64 7D 4B 89 5D FF FF 89 00 02 95 8E 2C 14 A7 11";
+  assert.strictEqual(core.parseKlinePacket(badCs), null);
+});
+
+check("All sample_frames.js entries parse cleanly as Table 11", () => {
+  const sandbox = { window: {} };
+  vm.runInNewContext(fs.readFileSync(path.join(wwwDir, "sample_frames.js"), "utf8"), sandbox);
+  const frames = sandbox.window.SAMPLE_FRAMES;
+  assert(Array.isArray(frames) && frames.length > 50);
+  for (const item of frames) {
+    const p = core.parseKlinePacket(item.h);
+    assert(p && p.kind === "table11", "Bad sample frame: " + item.h);
+    assert.strictEqual(typeof p.rpm, "number");
+    assert.strictEqual(typeof p.o2Volt, "number");
+    assert.strictEqual(typeof p.afrEst, "string");
+  }
+});
+
+check("parseRecordedCsv parses recorded REC CSV files for offline replay", () => {
+  const csv = [
+    "Timestamp,RPM,TPS_V,TPS_Pct,ECT_C,IAT_C,MAP_kPa,VBAT_V,VSS_kmh,Gear,INJ_ms,Duty_Pct,IGN_deg,IACV,O2_V,AFR,DFCO",
+    "2026-11-25T06:00:00.000Z,6540,3.82,78,88,35,92,14.10,41,1,7.85,42.8,28,34,0.72,13.5,0",
+    "2026-11-25T06:00:00.160Z,4800,0.45,0,88,35,24,14.20,58,3,0.00,0.0,15,28,0.12,CUT,1"
+  ].join("\n");
+  const parsed = core.parseRecordedCsv(csv);
+  assert.strictEqual(parsed.length, 2);
+  assert.strictEqual(parsed[0].rpm, 6540);
+  assert.strictEqual(parsed[0].vssKmh, 41);
+  assert.strictEqual(parsed[0].afrEst, "13.5");
+  assert.strictEqual(parsed[1].dfco, true);
+  assert.strictEqual(parsed[1].afrEst, "CUT");
+});
+
+console.log("=== 3. Virtual Gear v2 & Gear 1 Pull-Learn Math ===");
+
+check("Pull-Learn Gear 1 (kéo max tua) locks G1 & extrapolates G2..G6 accurately", () => {
+  const learner = core.createGearPullLearner();
+  learner.startPull1();
+
+  // Simulate Gear 1 acceleration 3000 -> 9600 RPM at true ratio ~185 RPM/(km/h)
+  const trueR1 = 185.0;
+  for (let rpm = 3000; rpm <= 9600; rpm += 550) {
+    const vss = Math.round(rpm / trueR1);
+    learner.feed(rpm, vss, 85);
+  }
+  // Inject a clutch slip outlier + decel zero-TPS outlier that learner must reject
+  learner.feed(9800, 10, 90);
+  learner.feed(4000, 35, 0);
+
+  const res = learner.finish();
+  assert.strictEqual(res.ok, true);
+  assert.strictEqual(res.gear, 1);
+  assert(Math.abs(res.ratio - trueR1) < 6, `Expected G1 ~${trueR1}, got ${res.ratio}`);
+  const norm = core.normalizeGearModel(res.ratios);
+  assert.strictEqual(norm.ratios.length, 6);
+  assert(norm.ratios[5] < norm.ratios[1] && norm.ratios[1] < norm.ratios[0], "Normalized ratios must descend strictly G1 > G2 > .. > G6");
+});
+
+check("Continuous 1->6 Pull-Learn detects upshifts automatically", () => {
+  const learner = core.createGearPullLearner();
+  learner.startAutoSequence();
+  const simRatios = [192, 138, 107, 87, 74, 65];
+  simRatios.forEach((r) => {
+    for (let rpm = 4200; rpm <= 7800; rpm += 600) {
+      learner.feed(rpm, Math.round(rpm / r), 60);
     }
-  }
+  });
+  const res = learner.finish();
+  assert.strictEqual(res.ok, true);
+  assert(res.lockedCount >= 5, "Should detect >=5 gears, got " + res.lockedCount);
+});
 
-  if (matched !== null) {
-    if (matched === gearState.candidate) {
-      gearState.confidence++;
-      if (gearState.confidence >= 3) {
-        gearState.current = matched;
-        gearState.lastShiftTs = now;
-      }
-    } else {
-      gearState.candidate = matched;
-      gearState.confidence = 1;
-    }
-  } else {
-    gearState.confidence = 0;
-    if (now - gearState.lastShiftTs > 600) {
-      gearState.current = "--";
-    }
+check("GearTracker: low-VSS guard + clutch-in freeze + hysteresis work properly", () => {
+  const tracker = core.createGearTracker([185, 133, 104, 84, 72, 63]);
+  // Move into Gear 1 smoothly
+  let gear;
+  for (let i = 0; i < 4; i++) {
+    gear = tracker.update(5550, 30, 1000 + i * 160);
   }
-  return gearState.current;
+  assert.strictEqual(gear, "1");
+
+  // Sudden clutch-in RPM drop at speed should hold "1" momentarily instead of snapping to N
+  gear = tracker.update(2800, 29, 1700);
+  assert.strictEqual(gear, "1");
+  assert.strictEqual(tracker.getState().frozenByClutch, true);
+
+  // Low-speed quantization at 4->5 km/h: without VSS+/-0.7 guard, ratio drops 185->148 (<156.9 midpoint) and would falsely upshift to G2
+  const slowTracker = core.createGearTracker([185, 133, 104, 84, 72, 63]);
+  slowTracker.update(740, 4, 5000);
+  slowTracker.update(740, 4, 5160);
+  assert.strictEqual(slowTracker.update(740, 5, 5320), "1");
+  assert.strictEqual(slowTracker.update(740, 5, 5480), "1");
+});
+
+check("GearTracker v3: anti-coasting locks Gear 1 when âm côn (~1610 RPM, TPS=0%) & unlocks on real upshift", () => {
+  const tracker = core.createGearTracker([185, null, null, null, null, null]);
+  // 1. Learn adaptive idle RPM around 1610 RPM while stopped
+  for (let i = 0; i < 8; i++) {
+    assert.strictEqual(tracker.update(1610, 0, i * 160, 0, 2.26), "N");
+  }
+  assert(Math.abs(tracker.getState().idleRpm - 1610) < 30);
+
+  // 2. Accelerate in Gear 1 with throttle open
+  for (let i = 0; i < 4; i++) {
+    tracker.update(5550, 30, 2000 + i * 160, 45, 5.2);
+  }
+  assert.strictEqual(tracker.update(5550, 30, 2700, 45, 5.2), "1");
+
+  // 3. User pulls clutch to coast (âm côn để xe trôi): TPS=0%, INJ=2.2ms idle, RPM drops across G2..G5 ratios while VSS stays 28..22 km/h
+  const coastProfile = [
+    [4100, 29], [3100, 28], [2350, 27], [1850, 26],
+    [1640, 25], [1615, 24], [1610, 23], [1605, 22], [1610, 21]
+  ];
+  coastProfile.forEach(([rpm, vss], idx) => {
+    const g = tracker.update(rpm, vss, 3000 + idx * 160, 0, 2.25);
+    assert.strictEqual(g, "1", `Must hold Gear 1 while coasting at ${rpm} RPM / ${vss} km/h, got ${g}`);
+    assert.strictEqual(tracker.getState().frozenByClutch, true);
+  });
+
+  // 4. Release clutch and open throttle cleanly into Gear 2 (RPM 4200, VSS 34 -> ratio ~123.5)
+  tracker.update(4200, 34, 5000, 38, 4.8);
+  tracker.update(4300, 35, 5160, 42, 5.0);
+  tracker.update(4420, 36, 5320, 45, 5.2);
+  const nextGear = tracker.update(4540, 37, 5480, 48, 5.4);
+  assert.strictEqual(nextGear, "2");
+  assert.strictEqual(tracker.getState().frozenByClutch, false);
+});
+
+if (process.exitCode && process.exitCode !== 0) {
+  process.exit(process.exitCode);
 }
-
-// Function to parse packet
-function parseKlinePacket(line) {
-  if (!line || typeof line !== "string") return null;
-  let cleaned = line.trim();
-  if (cleaned.includes("RAW:")) cleaned = cleaned.split("RAW:")[1].trim();
-  if (cleaned.includes("Data khac:")) cleaned = cleaned.replace("Data khac:", "").trim();
-  if (cleaned.includes("T11:")) cleaned = cleaned.split("T11:")[1].trim();
-
-  const parts = cleaned.split(/\s+/);
-  if (parts.length < 4) return null;
-  const bytes = [];
-  for (let i = 0; i < parts.length; i++) {
-    if (!/^[0-9a-fA-F]{1,2}$/.test(parts[i])) return null;
-    bytes.push(parseInt(parts[i], 16));
-  }
-
-  for (let i = 0; i <= bytes.length - 4; i++) {
-    if (bytes[i] !== 0x02) continue;
-    const len = bytes[i + 1];
-    if (len < 4 || i + len > bytes.length) continue;
-
-    let sum = 0;
-    for (let j = 0; j < len; j++) sum += bytes[i + j];
-    if ((sum & 0xFF) !== 0) continue;
-
-    const ecu = bytes.slice(i, i + len);
-    const svc = ecu[2];
-    const tbl = ecu[3];
-
-    if (svc === 0x71 && tbl === 0x11 && len === 0x19) {
-      const rpm = (ecu[4] << 8) | ecu[5];
-      const vssKmh = ecu[17];
-      return { rpm, vssKmh };
-    }
-  }
-  return null;
-}
-
-let parsed = 0;
-let gears = { 'N': 0, '1': 0, '2': 0, '3': 0, '4': 0, '5': 0, '6': 0, '--': 0 };
-let simulatedTs = 1000;
-
-for (const item of frames) {
-  const raw = item.h || item;
-  const f = parseKlinePacket(raw);
-  if (f) {
-    parsed++;
-    simulatedTs += 100; // 10Hz
-    const g = calculateGear(f.rpm, f.vssKmh, simulatedTs);
-    gears[g] = (gears[g] || 0) + 1;
-  }
-}
-
-console.log('Parsed sample frames successfully:', parsed);
-console.log('Gear distribution across sample log:', gears);
-
-// Synthetic gear test
-console.log('\n--- Synthetic Ratio Test for Winner X ---');
-const tests = [
-  { rpm: 1400, vss: 0, expect: 'N' },
-  { rpm: 4800, vss: 30, expect: '1' }, // 4800/30 = 160 (Gear 1: 160.8)
-  { rpm: 5350, vss: 50, expect: '2' }, // 5350/50 = 107 (Gear 2: 107.5)
-  { rpm: 6240, vss: 80, expect: '3' }, // 6240/80 = 78 (Gear 3: 78.2)
-  { rpm: 6260, vss: 100, expect: '4' }, // 6260/100 = 62.6 (Gear 4: 62.6)
-  { rpm: 5410, vss: 100, expect: '5' }, // 5410/100 = 54.1 (Gear 5: 54.1)
-  { rpm: 5688, vss: 120, expect: '6' }, // 5688/120 = 47.4 (Gear 6: 47.4)
-];
-
-for (const t of tests) {
-  let res;
-  for (let step = 0; step < 3; step++) { // 3 debounce frames
-    simulatedTs += 100;
-    res = calculateGear(t.rpm, t.vss, simulatedTs);
-  }
-  console.log(`RPM: ${t.rpm}, VSS: ${t.vss} km/h -> Gear: ${res} (Expected: ${t.expect}) => ${res === t.expect ? 'PASS' : 'FAIL'}`);
-}
+console.log(`\nALL ${passed} TESTS PASSED.`);

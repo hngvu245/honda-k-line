@@ -13,6 +13,8 @@ import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.webkit.ConsoleMessage;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
@@ -41,6 +43,7 @@ public class MainActivity extends Activity {
         win.setStatusBarColor(Color.parseColor("#090A0D"));
         win.setNavigationBarColor(Color.parseColor("#090A0D"));
 
+        WebView.setWebContentsDebuggingEnabled(true);
         webView = new WebView(this);
         webView.setBackgroundColor(Color.parseColor("#090A0D"));
 
@@ -53,6 +56,19 @@ public class MainActivity extends Activity {
 
         btBridge = new BtBridge(this, webView);
         webView.addJavascriptInterface(btBridge, "AndroidBT");
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
+                if (btBridge != null && consoleMessage != null) {
+                    ConsoleMessage.MessageLevel lvl = consoleMessage.messageLevel();
+                    if (lvl == ConsoleMessage.MessageLevel.ERROR || lvl == ConsoleMessage.MessageLevel.WARNING) {
+                        btBridge.logDebug("WEB_" + lvl.name(),
+                            consoleMessage.message() + " (" + consoleMessage.sourceId() + ":" + consoleMessage.lineNumber() + ")");
+                    }
+                }
+                return super.onConsoleMessage(consoleMessage);
+            }
+        });
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {

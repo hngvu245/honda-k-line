@@ -303,9 +303,15 @@ public class UsbSerialManager {
         String chip = getChipName(device);
         notifyStatus("connected", "Đã kết nối USB OTG · " + chip + " (115200 8N1)");
 
-        // Send initial newline flush and one-time WAKEUP pulse to kickstart STM32
-        mainHandler.postDelayed(() -> write("\r\n\r\n".getBytes()), 100);
-        mainHandler.postDelayed(() -> write("WAKEUP\r\n".getBytes()), 300);
+        // Flush serial buffer briefly, then only trigger WAKEUP if STM32 isn't already streaming
+        mainHandler.postDelayed(() -> {
+            if (isRunning && isConnected()) write("\r\n".getBytes(StandardCharsets.US_ASCII));
+        }, 150);
+        mainHandler.postDelayed(() -> {
+            if (isRunning && isConnected() && rxBytesTotal == 0) {
+                write("WAKEUP\r\n".getBytes(StandardCharsets.US_ASCII));
+            }
+        }, 1000);
     }
 
     public synchronized void sendWakeup() {

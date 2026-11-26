@@ -4,6 +4,7 @@
 import csv
 import datetime
 import logging
+import math
 import os
 import threading
 import time
@@ -338,6 +339,12 @@ class HondaRacingDashboard(ctk.CTk):
         self.gear_current = "N"
         self.gear_candidate = "N"
         self.gear_confidence = 0
+        self.gear_prev_rpm = None
+        self.gear_idle_rpm = 1550.0
+        self.gear_drop_streak = 0
+        self.gear_throttle_streak = 0
+        self.gear_dfco_streak = 0
+        self.gear_clutch_coasting = False
         self.gear_last_shift_ts = 0.0
         self.casual_banner_var = ctk.StringVar(value="Chờ dữ liệu từ ECU xe Honda...")
         self.casual_trip_var = ctk.StringVar(value="Nổ máy: 00:00  ·  Peak: -- RPM  ·  Max Ga: -- %  ·  Min Đề: -- V")
@@ -1726,6 +1733,12 @@ class HondaRacingDashboard(ctk.CTk):
         self.gear_current = "N"
         self.gear_candidate = "N"
         self.gear_confidence = 0
+        self.gear_prev_rpm = None
+        self.gear_idle_rpm = 1550.0
+        self.gear_drop_streak = 0
+        self.gear_throttle_streak = 0
+        self.gear_dfco_streak = 0
+        self.gear_clutch_coasting = False
         self.gear_var.set("N")
         self.gear_sub_var.set("MO / DUNG XE")
         if hasattr(self, "casual_gear_lbl"):
@@ -1756,41 +1769,128 @@ class HondaRacingDashboard(ctk.CTk):
         self.pull_cur_var.set("--.-- s")
         self.pull_best_var.set("BEST: --.-- s")
 
-    def calculate_gear(self, rpm: int, vss: int, now: float) -> str:
-        if not rpm or rpm < 350:
+    def calculate_gear(self, rpm: int, vss: int, now: float, tps_pct=None, inj_ms=None) -> str:
+        has_tps = tps_pct is not None
+        has_inj = inj_ms is not None
+
+        if not rpm or rpm < 380:
             self.gear_current = "--"
+            self.gear_candidate = "--"
+            self.gear_confidence = 0
+            self.gear_prev_rpm = rpm or 0
+            self.gear_drop_streak = 0
+            self.gear_throttle_streak = 0
+            self.gear_dfco_streak = 0
+            self.gear_clutch_coasting = False
             return "--"
+
+        d_rpm = (rpm - self.gear_prev_rpm) if self.gear_prev_rpm is not None else 0
+        self.gear_prev_rpm = rpm
+
         if not vss or vss < 2:
+            if (not has_tps or tps_pct <= 1.2) and 450 <= rpm <= 2400:
+                self.gear_idle_rpm = self.gear_idle_rpm * 0.85 + rpm * 0.15
             self.gear_current = "N"
             self.gear_candidate = "N"
             self.gear_confidence = 0
+            self.gear_drop_streak = 0
+            self.gear_throttle_streak = 0
+            self.gear_dfco_streak = 0
+            self.gear_clutch_coasting = False
             return "N"
 
-        r = rpm / vss
+        idle_ceil = self.gear_idle_rpm + 320.0
+        throttle_closed = has_tps and tps_pct <= 2.5
+        throttle_open = has_tps and tps_pct > 3.5
+        idle_injecting = (not has_inj) or inj_ms > 0.4
+        is_dfco = throttle_closed and has_inj and inj_ms < 0.05 and rpm > (idle_ceil + 300.0)
+        in_gear = self.gear_current not in ("N", "--")
+
+        self.gear_throttle_streak = (self.gear_throttle_streak + 1) if throttle_open else 0
+        self.gear_dfco_streak = (self.gear_dfco_streak + 1) if is_dfco else 0
+        self.gear_drop_streak = (self.gear_drop_streak + 1) if (d_rpm <= -110 and (not has_tps or throttle_closed)) else 0
+
+        if in_gear and vss >= 4:
+            if self.gear_clutch_coasting:
+                reengaged = (
+                    (has_tps and (self.gear_throttle_streak >= 2 or (d_rpm > 220 and rpm > idle_ceil)))
+                    or self.gear_dfco_streak >= 3
+                    or ((not has_tps) and rpm > (idle_ceil + 350.0) and d_rpm >= -80 and not idle_injecting)
+                )
+                if not reengaged:
+                    self.gear_confidence = 0
+                    self.gear_last_shift_ts = now
+                    return self.gear_current
+                self.gear_clutch_coasting = False
+            else:
+                drop_coast = (throttle_closed and (d_rpm <= -220 or self.gear_drop_streak >= 2)) if has_tps else (d_rpm <= -450)
+                plateau_coast = ((not has_tps) or throttle_closed) and rpm <= idle_ceil and idle_injecting
+                if drop_coast or plateau_coast:
+                    self.gear_clutch_coasting = True
+                    self.gear_confidence = 0
+                    self.gear_last_shift_ts = now
+                    return self.gear_current
+        else:
+            self.gear_clutch_coasting = False
+
         cfg = GEAR_PRESETS.get(self.active_gear_preset, GEAR_PRESETS["winner150"])
         ratios = cfg["ratios"]
-        tolerance = cfg["tolerance"]
+        n = len(ratios)
+        r = rpm / vss
+        top_bound = ratios[0] * (1.28 + 1.5 / max(vss, 2))
+        bot_bound = ratios[-1] * 0.84
 
         matched = None
-        min_err = 999.0
-        for i, target in enumerate(ratios):
-            err = abs(r - target) / target
-            if err < tolerance and err < min_err:
-                min_err = err
-                matched = str(i + 1)
+        if bot_bound <= r <= top_bound:
+            if vss < 15 and in_gear:
+                idx_cur = int(self.gear_current) - 1
+                if 0 <= idx_cur < n:
+                    r_lo = rpm / (vss + 0.7)
+                    r_hi = rpm / max(1.0, vss - 0.7)
+                    hi_b = top_bound if idx_cur == 0 else math.sqrt(ratios[idx_cur - 1] * ratios[idx_cur])
+                    lo_b = bot_bound if idx_cur == n - 1 else math.sqrt(ratios[idx_cur] * ratios[idx_cur + 1])
+                    if r_lo <= hi_b and r_hi >= lo_b:
+                        matched = str(idx_cur + 1)
+            if matched is None:
+                for i in range(n - 1):
+                    if r >= math.sqrt(ratios[i] * ratios[i + 1]):
+                        matched = str(i + 1)
+                        break
+                if matched is None:
+                    matched = str(n)
 
         if matched is not None:
+            if matched == self.gear_current:
+                self.gear_last_shift_ts = now
+                self.gear_candidate = matched
+                self.gear_confidence = 0
+                return self.gear_current
+
+            cur_num = int(self.gear_current) if in_gear else 0
+            next_num = int(matched)
+            is_upshift = in_gear and next_num > cur_num
+            if is_upshift and throttle_closed and rpm < max(2300.0, self.gear_idle_rpm + 650.0) and d_rpm <= 0:
+                self.gear_confidence = 0
+                return self.gear_current
+
+            single_step = (not in_gear) or abs(next_num - cur_num) == 1
+            req_frames = 2 if single_step else 4
+            if not single_step and rpm < 1800:
+                self.gear_confidence = 0
+                return self.gear_current
+
             if matched == self.gear_candidate:
                 self.gear_confidence += 1
-                if self.gear_confidence >= 3:
+                if self.gear_confidence >= req_frames:
                     self.gear_current = matched
                     self.gear_last_shift_ts = now
+                    self.gear_confidence = 0
             else:
                 self.gear_candidate = matched
                 self.gear_confidence = 1
         else:
             self.gear_confidence = 0
-            if now - self.gear_last_shift_ts > 0.6:
+            if now - self.gear_last_shift_ts > 1.2:
                 self.gear_current = "--"
         return self.gear_current
 
@@ -1968,7 +2068,7 @@ class HondaRacingDashboard(ctk.CTk):
         self.eng_vars["vss"][2].set(f"PKT #{self.frame_count}")
 
         # Virtual Gear Estimator Calculation & Visual Update
-        gear_val = self.calculate_gear(rpm, d["vss_kmh"], now)
+        gear_val = self.calculate_gear(rpm, d["vss_kmh"], now, d["tps_pct"], d["inj_ms"])
         self.gear_var.set(gear_val)
         if gear_val == "N":
             gear_col = THEME["gear_n"]

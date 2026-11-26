@@ -1,1597 +1,1800 @@
 (function () {
   "use strict";
 
-  const HONDA_DTC_DICT = {
-    1: "Lỗi cảm biến áp suất cổ hút (MAP)",
-    7: "Lỗi cảm biến nhiệt độ nước làm mát (ECT)",
-    8: "Lỗi cảm biến vị trí bướm ga (TPS)",
-    9: "Lỗi cảm biến nhiệt độ khí nạp (IAT)",
-    11: "Lỗi cảm biến tốc độ xe (VSS)",
-    12: "Lỗi mạch kim phun xăng (Injector)",
-    21: "Lỗi cảm biến khí thải Oxy (O2)",
-    23: "Lỗi mạch sấy cảm biến Oxy (O2 Heater)",
-    29: "Lỗi van điều khiển cầm chừng (IACV)",
-    33: "Lỗi bộ nhớ trong ECU (EEPROM)",
-    54: "Lỗi cảm biến góc nghiêng xe (Bank Angle)"
-  };
-
-  const RPM_BINS = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000];
-  const TPS_BINS = [0, 10, 20, 35, 50, 65, 80, 95];
-  const LED_COUNT = 26;
-  const MAX_RPM_SCALE = 13000;
-  const MAX_SCOPE = 140;
-
-  // Virtual Gear Estimator Configuration & State
-  const GEAR_PRESETS = {
-    winner150: {
-      name: "Honda Winner X / CBR150 (6 số)",
-      gears: 6,
-      ratios: [160.8, 107.5, 78.2, 62.6, 54.1, 47.4],
-      tolerance: 0.10
-    },
-    wave110: {
-      name: "Honda Wave / Future (4 số)",
-      gears: 4,
-      ratios: [135.0, 82.0, 58.0, 44.0],
-      tolerance: 0.10
-    },
-    exciter150: {
-      name: "Yamaha Exciter 150 (5 số)",
-      gears: 5,
-      ratios: [145.0, 96.0, 72.0, 57.0, 48.0],
-      tolerance: 0.10
-    }
-  };
-
-  let activeGearPreset = localStorage.getItem("kline_gear_preset") || "winner150";
-  let customRatios = null;
-  try {
-    customRatios = JSON.parse(localStorage.getItem("kline_custom_ratios"));
-  } catch (_e) {}
-
-  let gearState = {
-    current: "N",
-    candidate: "N",
-    confidence: 0,
-    lastShiftTs: 0
-  };
-
-  function calculateGear(rpm, vss) {
-    if (!rpm || rpm < 350) {
-      gearState.current = "--";
-      return "--";
-    }
-    // Standstill (VSS < 2 km/h) with engine running -> Neutral
-    if (!vss || vss < 2) {
-      gearState.current = "N";
-      gearState.candidate = "N";
-      gearState.confidence = 0;
-      return "N";
-    }
-
-    const r = rpm / vss;
-    const cfg = GEAR_PRESETS[activeGearPreset] || GEAR_PRESETS.winner150;
-    const ratios = (customRatios && Array.isArray(customRatios)) ? customRatios : cfg.ratios;
-
-    let matched = null;
-    let minErr = Infinity;
-    for (let i = 0; i < ratios.length; i++) {
-      const target = ratios[i];
-      const err = Math.abs(r - target) / target;
-      if (err < cfg.tolerance && err < minErr) {
-        minErr = err;
-        matched = String(i + 1);
-      }
-    }
-
-    const now = performance.now();
-    if (matched !== null) {
-      if (matched === gearState.candidate) {
-        gearState.confidence++;
-        if (gearState.confidence >= 3) {
-          gearState.current = matched;
-          gearState.lastShiftTs = now;
-        }
-      } else {
-        gearState.candidate = matched;
-        gearState.confidence = 1;
-      }
-    } else {
-      gearState.confidence = 0;
-      if (now - gearState.lastShiftTs > 600) {
-        gearState.current = "--";
-      }
-    }
-    return gearState.current;
-  }
-
-  // Odometer & Trip Computer
-  let odoMeters = parseFloat(localStorage.getItem("kline_odo_m") || "506000");
-  let tripMeters = parseFloat(localStorage.getItem("kline_trip_m") || "0");
-  let lastOdoTs = null;
-
-  function updateOdometer(vssKmh) {
-    const now = performance.now();
-    if (lastOdoTs !== null && vssKmh > 0) {
-      const dtSec = Math.min(2.0, (now - lastOdoTs) / 1000.0);
-      const deltaMeters = (vssKmh * 1000.0 / 3600.0) * dtSec;
-      odoMeters += deltaMeters;
-      tripMeters += deltaMeters;
-    }
-    lastOdoTs = now;
-  }
-
-  let uiMode = localStorage.getItem("kline_ui_mode") || "casual";
-  let activeCasualTab = "overview";
-  let activeNerdyTab = "sensors";
-  let redlineRpm = parseInt(localStorage.getItem("kline_redline") || "9000", 10);
-
-  let trip = loadTrip();
-  let oilHoursBase = parseFloat(localStorage.getItem("kline_oil_sec") || "0");
-
-  // Signal / Connection State (-- everywhere until live frame arrives)
-  let hasLiveSignal = false;
-  let sweepActive = false;
-  let sweepStartTs = 0;
-  let latestFrame = null;
-  let btConnected = false;
-  let usbConnected = false;
-
-  let frameCount = 0;
-  let lastFrameTs = null;
-  let prevEct = null;
-  let maxEctSession = null;
-  const scopeHistory = [];
-  const scopeEnabled = { rpm: true, tps: true, map: true, inj: false, o2: false };
-  let scopeFrozen = false;
-  let scopeHoverIdx = null;
-  let strobePhase = false;
-  let scsActive = false;
-  let faultCount = 0;
-
-  const minmax = {};
-  const mapCells = {};
-  let activeCellKey = null;
-  let mapMetric = "INJ";
-
-  let pullState = "IDLE";
-  let pullT0 = 0;
-  let pullBest = null;
-
-  // CSV REC Session Logger
-  let isRecording = false;
-  let recStartMs = 0;
-  let recRows = [];
-
-  const sampleFrames = Array.isArray(window.SAMPLE_FRAMES) ? window.SAMPLE_FRAMES : [];
-  let replayRunning = false;
-  let replayIndex = 0;
-  let replaySpeed = 1;
-  let replayTimer = null;
-
-  function loadTrip() {
-    try {
-      const s = JSON.parse(localStorage.getItem("kline_trip_v2") || "{}");
-      return {
-        runSec: s.runSec || 0,
-        peakRpm: s.peakRpm || 0,
-        peakVss: s.peakVss || 0,
-        maxTps: s.maxTps || 0,
-        warnCount: s.warnCount || 0,
-        minBat: s.minBat || null,
-        maxBat: s.maxBat || null
-      };
-    } catch (_e) {
-      return { runSec: 0, peakRpm: 0, peakVss: 0, maxTps: 0, warnCount: 0, minBat: null, maxBat: null };
-    }
-  }
-
-  function saveTrip() {
-    try {
-      localStorage.setItem("kline_trip_v2", JSON.stringify(trip));
-      localStorage.setItem("kline_oil_sec", String(oilHoursBase));
-      localStorage.setItem("kline_odo_m", odoMeters.toFixed(1));
-      localStorage.setItem("kline_trip_m", tripMeters.toFixed(1));
-    } catch (_e) {}
-  }
-
-  function decodeDtcByte(b) {
-    const hi = b >> 4;
-    const lo = b & 0x0F;
-    const bcd = (hi <= 9 && lo <= 9) ? (hi * 10 + lo) : b;
-    const code = HONDA_DTC_DICT[bcd] ? bcd : (HONDA_DTC_DICT[b] ? b : bcd);
-    const desc = HONDA_DTC_DICT[code] || ("Mã lỗi Honda #" + code + " (0x" + b.toString(16).toUpperCase().padStart(2, "0") + ")");
-    return { code, raw: "0x" + b.toString(16).toUpperCase().padStart(2, "0"), desc };
-  }
-
-  function parseKlinePacket(line) {
-    if (!line || typeof line !== "string") return null;
-    let cleaned = line.trim();
-    if (cleaned.includes("RAW:")) cleaned = cleaned.split("RAW:")[1].trim();
-    if (cleaned.includes("Data khac:")) cleaned = cleaned.replace("Data khac:", "").trim();
-    if (cleaned.includes("T11:")) cleaned = cleaned.split("T11:")[1].trim();
-
-    const parts = cleaned.split(/\s+/);
-    const bytes = [];
-    for (let i = 0; i < parts.length; i++) {
-      const p = parts[i].trim();
-      if (/^[0-9a-fA-F]{1,2}$/.test(p)) {
-        bytes.push(parseInt(p, 16));
-      }
-    }
-    if (bytes.length < 4) return null;
-
-    for (let i = 0; i <= bytes.length - 4; i++) {
-      if (bytes[i] !== 0x02) continue;
-      const len = bytes[i + 1];
-      if (len < 4 || i + len > bytes.length) continue;
-
-      let sum = 0;
-      for (let j = 0; j < len; j++) sum += bytes[i + j];
-      if ((sum & 0xFF) !== 0) continue;
-
-      const ecu = bytes.slice(i, i + len);
-      const svc = ecu[2];
-      const tbl = ecu[3];
-
-      if (svc === 0x71 && tbl === 0x11 && len === 0x19) {
-        const rpm = (ecu[4] << 8) | ecu[5];
-        const tpsVolt = (ecu[6] * 5.0) / 256.0;
-        const tpsPct = Math.min(Math.round((ecu[7] / 1.56) * 10) / 10, 100.0);
-        const ectVolt = (ecu[8] * 5.0) / 256.0;
-        const ectC = ecu[9] - 40;
-        const iatVolt = (ecu[10] * 5.0) / 256.0;
-        const iatC = ecu[11] - 40;
-        const mapVolt = (ecu[12] * 5.0) / 256.0;
-        const mapKpa = ecu[13];
-        const vbat = Math.round((ecu[16] / 10.0) * 10) / 10;
-        const vssKmh = ecu[17];
-        const injMs = ((ecu[18] << 8) | ecu[19]) * 0.00390625;
-        const ignDeg = (ecu[20] - 128) * 0.5;
-        const iacvStp = ecu[21];
-        const o2Volt = ecu[23] / 256.0;
-        const dfco = rpm > 2200 && ecu[7] === 0 && injMs < 0.01;
-        const injDuty = Math.min(Math.round(((rpm * injMs) / 1200.0) * 10) / 10, 100.0);
-        const afrEst = dfco ? "CUT" : (rpm === 0 ? "--" : Math.max(11.8, Math.min(16.5, 16.2 - o2Volt * 3.8)).toFixed(1));
-
-        return {
-          kind: "table11",
-          rpm, tpsVolt, tpsPct, tpsRaw: ecu[7],
-          ectVolt, ectC, iatVolt, iatC, mapVolt, mapKpa,
-          vbat, vssKmh, injMs, injDuty, ignDeg, iacvStp, o2Volt, afrEst, dfco,
-          rawHex: ecu.map((b) => b.toString(16).toUpperCase().padStart(2, "0")).join(" ")
-        };
-      }
-
-      if (svc === 0x71 && tbl === 0x00 && len >= 6) {
-        return {
-          kind: "ecmid",
-          ecmId: ecu.slice(4, len - 1).map((b) => b.toString(16).toUpperCase().padStart(2, "0")).join(" ")
-        };
-      }
-
-      if (svc === 0x71 && (tbl === 0x73 || tbl === 0x74)) {
-        const dtcType = tbl === 0x73 ? "Hiện tại" : "Quá khứ";
-        const faults = [];
-        for (let k = 4; k < len - 1; k++) {
-          if (ecu[k] !== 0x00 && ecu[k] !== 0xFF) faults.push(decodeDtcByte(ecu[k]));
-        }
-        return { kind: "dtc", dtcType, faults };
-      }
-
-      if (svc === 0x60) return { kind: "clear_dtc_ack" };
-
-      return {
-        kind: "custom",
-        table: "0x" + tbl.toString(16).toUpperCase().padStart(2, "0"),
-        rawHex: ecu.map((b) => b.toString(16).toUpperCase().padStart(2, "0")).join(" ")
-      };
-    }
-    return null;
-  }
-
-  function parseTable11Line(line) {
-    const p = parseKlinePacket(line);
-    return p && p.kind === "table11" ? p : null;
-  }
-
-  if (typeof document === "undefined") {
-    return;
+  const Core = window.KlineCore;
+  if (!Core) {
+    throw new Error("KlineCore module missing (kline_core.js must load before app.js)");
   }
 
   const $ = (id) => document.getElementById(id);
+  const hasBridge = () => typeof window.AndroidBT !== "undefined" && window.AndroidBT !== null;
 
-  // Build 26 slanted segments (500 RPM each) + mathematical 0..13 tick marks
-  function buildTach(ledsEl, scaleEl) {
-    const arr = [];
-    for (let i = 0; i < LED_COUNT; i++) {
+  const LS_KEYS = {
+    redline: "kline_redline_rpm",
+    oilKm: "kline_oil_km",
+    odoKm: "kline_odo_km",
+    learnedRatios: "kline_learned_ratios_v2"
+  };
+
+  /* ── IN-APP DEBUG LOG RING BUFFER ── */
+  const jsDebugBuffer = [];
+  function logAppDebug(level, msg) {
+    const ts = new Date().toTimeString().slice(0, 8);
+    const line = `[${ts}] [${level}] ${msg}`;
+    jsDebugBuffer.push(line);
+    if (jsDebugBuffer.length > 120) jsDebugBuffer.shift();
+    if (hasBridge() && typeof window.AndroidBT.logDebug === "function") {
+      try { window.AndroidBT.logDebug(level, String(msg)); } catch (_) {}
+    }
+    const page = document.body.dataset.page;
+    if (page === "nerdy-lab") renderDebugConsole();
+  }
+
+  window.addEventListener("error", (ev) => {
+    logAppDebug("JS_ERR", `${ev.message} (${ev.filename || "app"}:${ev.lineno || 0})`);
+  });
+  window.addEventListener("unhandledrejection", (ev) => {
+    logAppDebug("PROMISE_ERR", String(ev.reason || "Unknown rejection"));
+  });
+
+  /* ── PERSISTENCE HELPERS ── */
+  function loadNum(key, fallback) {
+    try {
+      const v = parseFloat(localStorage.getItem(key));
+      return Number.isFinite(v) ? v : fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+  function saveVal(key, val) {
+    try { localStorage.setItem(key, String(val)); } catch (_) {}
+  }
+  function loadLearnedGearModel() {
+    try {
+      const raw = localStorage.getItem(LS_KEYS.learnedRatios);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed.ratios) && parsed.ratios.length === 6 ? parsed : null;
+    } catch (_) {
+      return null;
+    }
+  }
+  function saveLearnedGearModel(ratios, sources) {
+    try {
+      localStorage.setItem(LS_KEYS.learnedRatios, JSON.stringify({
+        ratios,
+        sources: sources || ratios.map((_, i) => (i === 0 ? "learned" : "derived")),
+        savedAt: new Date().toISOString()
+      }));
+    } catch (_) {}
+  }
+
+  /* ── STATE ── */
+  const savedModel = loadLearnedGearModel();
+  const gearTracker = Core.createGearTracker(savedModel ? savedModel.ratios : null);
+  if (savedModel && savedModel.sources) {
+    gearTracker.getModel().sources.splice(0, 6, ...savedModel.sources);
+  }
+  const gearLearner = Core.createGearPullLearner(savedModel ? savedModel.ratios : null);
+
+  let redlineRpm = loadNum(LS_KEYS.redline, 10500);
+  let uiMode = "casual";
+  let currentPage = "casual-overview";
+  let connState = "disconnected";
+  let hasLiveData = false;
+  let lastFrame = null;
+  let lastFramePerf = 0;
+
+  let peakRpm = 0;
+  let peakTps = 0;
+  let lastGearChar = "-";
+  let faultCount = 0;
+  let activeEcmId = "-- -- -- -- --";
+
+  let odoKm = loadNum(LS_KEYS.odoKm, 0);
+  let oilKm = loadNum(LS_KEYS.oilKm, 0);
+  let tripMeters = 0;
+  let lastSpeedIntegrateMs = 0;
+
+  const tripStats = {
+    startMs: Date.now(),
+    engineRunSec: 0,
+    lastRunTickMs: 0,
+    peakRpm: 0,
+    peakTps: 0,
+    peakVss: 0,
+    minVbat: null,
+    maxVbat: null,
+    warnCount: 0,
+    warnBannerActive: false
+  };
+
+  const bounds = {
+    tps: [null, null], map: [null, null], inj: [null, null], ign: [null, null], o2: [null, null],
+    iacv: [null, null], ect: [null, null], iat: [null, null], vbat: [null, null], vss: [null, null]
+  };
+
+  const history = [];
+  const HISTORY_MAX = 180;
+  const hexLines = [];
+
+  /* Recording & Replay / Demo */
+  let isRecording = false;
+  let csvRows = [];
+  let hexPaused = false;
+  let hudToolbarTimer = null;
+  let demoActive = false;
+  let demoPlaying = true;
+  let demoIdx = 0;
+  let demoSpeed = 1;
+  let demoTimer = null;
+  let replayFrames = [];
+  let replaySourceLabel = "DEMO";
+
+  /* Oscilloscope & Tuning */
+  const scopeEnabled = { rpm: true, tps: true, inj: true, ign: true };
+  let scopeFrozen = false;
+  let scopeCursorIdx = null;
+  let activeMapMetric = "inj";
+  const mapCells = {};
+  const pullTimer = { state: "idle", t0: 0, cur: 0, best: null };
+  let scsActive = false;
+
+  /* Smooth 60fps Interpolated Values */
+  const anim = {
+    targetRpm: 0,
+    targetVss: 0,
+    targetTps: 0,
+    dispRpm: 0,
+    dispVss: 0,
+    dispTps: 0,
+    rafId: 0,
+    lastRafMs: 0,
+    lastUiTextMs: 0
+  };
+
+  const isLandscape = () => window.innerWidth > window.innerHeight;
+
+  /* ── SHIFT LED RAIL SETUP ── */
+  const ledEls = { pCasual: [], pNerdy: [], lHud: [] };
+  function buildTachRail(ledsId, scaleId, targetArr) {
+    const ledsEl = $(ledsId);
+    const scaleEl = $(scaleId);
+    if (!ledsEl || !scaleEl) return;
+    ledsEl.innerHTML = "";
+    scaleEl.innerHTML = "";
+    targetArr.length = 0;
+
+    for (let i = 0; i < 14; i++) {
       const s = document.createElement("div");
       s.className = "sled";
       ledsEl.appendChild(s);
-      arr.push(s);
-    }
-    for (let k = 0; k <= 13; k++) {
+      targetArr.push(s);
+
       const tk = document.createElement("div");
-      const isRed = k >= 10;
-      tk.className = "scale-tick" + (k === 0 ? " is-first" : (k === 13 ? " is-last" : "")) + (isRed ? " is-redline" : "");
-      tk.style.left = ((k / 13) * 100).toFixed(4) + "%";
-      tk.innerHTML = "<i></i><span>" + k + "</span>";
+      const rpmVal = Math.round(((i + 1) / 14) * (redlineRpm / 1000));
+      const isRed = i >= 11;
+      tk.className = "scale-tick" + (i === 0 ? " is-first" : i === 13 ? " is-last" : "") + (isRed ? " is-red" : "");
+      tk.textContent = i % 2 === 0 || i === 13 ? String(rpmVal) : "";
       scaleEl.appendChild(tk);
     }
-    return arr;
   }
 
-  const ledsCasual = buildTach($("pCasualLeds"), $("pCasualScale"));
-  const ledsNerdy = buildTach($("pNerdyLeds"), $("pNerdyScale"));
-  const ledsLand = buildTach($("lShiftLeds"), $("lShiftScale"));
+  function rebuildAllTachRails() {
+    buildTachRail("pCasualLeds", "pCasualScale", ledEls.pCasual);
+    buildTachRail("pNerdyLeds", "pNerdyScale", ledEls.pNerdy);
+    buildTachRail("lShiftLeds", "lShiftScale", ledEls.lHud);
+  }
 
-  function updateLeds(arr, rpm, peak) {
-    if (rpm >= redlineRpm + 800) strobePhase = !strobePhase;
-    else strobePhase = false;
-    const litCount = Math.min(LED_COUNT, Math.floor((rpm / MAX_RPM_SCALE) * LED_COUNT));
-    const redStart = Math.max(20, Math.floor((redlineRpm / MAX_RPM_SCALE) * LED_COUNT));
-    const amberStart = Math.max(13, Math.floor((6500 / MAX_RPM_SCALE) * LED_COUNT));
-    const peakSeg = peak > 300 ? Math.min(LED_COUNT - 1, Math.floor((peak / MAX_RPM_SCALE) * LED_COUNT)) : -1;
-
-    for (let i = 0; i < LED_COUNT; i++) {
-      let cls = "sled";
-      if (i >= redStart) cls += " zone-red";
-      else if (i >= amberStart) cls += " zone-amber";
-
-      if (i < litCount) {
-        if (i >= redStart) cls += strobePhase ? "" : " on-red";
-        else if (i >= amberStart) cls += " on-amber";
-        else if (i < 6) cls += " on-cool";
-        else cls += " on-mid";
+  function updateLeds(rpm) {
+    const ratio = Math.max(0, Math.min(1, rpm / redlineRpm));
+    const litCount = Math.round(ratio * 14);
+    const allSets = [ledEls.pCasual, ledEls.pNerdy, ledEls.lHud];
+    for (let s = 0; s < allSets.length; s++) {
+      const arr = allSets[s];
+      for (let i = 0; i < arr.length; i++) {
+        let cls = "sled";
+        if (i < litCount) {
+          if (i >= 11) cls += " lit-r";
+          else if (i >= 8) cls += " lit-a";
+          else cls += " lit-c";
+        }
+        if (arr[i].className !== cls) arr[i].className = cls;
       }
-      if (i === peakSeg && !sweepActive) cls += " peak-hold";
-      arr[i].className = cls;
+    }
+  }
+
+  /* ── GPU BAR / TRANSFORM HELPERS ── */
+  function setScaleX(id, norm01) {
+    const el = $(id);
+    if (!el) return;
+    const clamped = Math.max(0, Math.min(1, norm01 || 0));
+    el.style.transform = `scaleX(${clamped.toFixed(4)})`;
+  }
+
+  /* ── 60FPS INTERPOLATION LOOP ── */
+  function stepAnimationFrame(nowMs) {
+    anim.rafId = 0;
+    if (document.hidden) return;
+
+    const dt = anim.lastRafMs > 0 ? Math.min(0.08, (nowMs - anim.lastRafMs) / 1000) : 0.016;
+    anim.lastRafMs = nowMs;
+    const alpha = 1 - Math.exp(-dt * 14.5);
+
+    anim.dispRpm += (anim.targetRpm - anim.dispRpm) * alpha;
+    anim.dispVss += (anim.targetVss - anim.dispVss) * alpha;
+    anim.dispTps += (anim.targetTps - anim.dispTps) * alpha;
+
+    if (Math.abs(anim.targetRpm - anim.dispRpm) < 6) anim.dispRpm = anim.targetRpm;
+    if (Math.abs(anim.targetVss - anim.dispVss) < 0.25) anim.dispVss = anim.targetVss;
+    if (Math.abs(anim.targetTps - anim.dispTps) < 0.3) anim.dispTps = anim.targetTps;
+
+    const r = Math.round(anim.dispRpm);
+    const v = Math.round(anim.dispVss);
+    const t = Math.max(0, Math.min(100, anim.dispTps));
+
+    const rpmNorm = r / Math.max(1000, redlineRpm);
+    const tpsNorm = t / 100;
+
+    setScaleX("cRpmSweep", rpmNorm);
+    setScaleX("lcRpmSweep", rpmNorm);
+    setScaleX("cTpsBgSweep", tpsNorm);
+    setScaleX("cTpsFill", tpsNorm);
+    setScaleX("nTpsFill", tpsNorm);
+    setScaleX("lcTpsBgSweep", tpsNorm);
+    setScaleX("lcTpsFill", tpsNorm);
+    setScaleX("lnTpsBgSweep", tpsNorm);
+    setScaleX("lnTpsFill", tpsNorm);
+
+    updateLeds(r);
+
+    // Throttle DOM numeric text updates lightly while bars stay locked at display refresh
+    if (nowMs - anim.lastUiTextMs >= 32) {
+      anim.lastUiTextMs = nowMs;
+      const isRed = r >= redlineRpm * 0.92;
+      const rpmStr = r.toLocaleString("en-US");
+      const vssStr = String(v);
+      const tpsStr = Math.round(t) + "%";
+
+      const cRpmEl = $("cRpm");
+      if (cRpmEl) {
+        cRpmEl.textContent = rpmStr;
+        cRpmEl.className = "hero-rpm-val" + (isRed ? " redline" : "");
+      }
+      const lcRpmEl = $("lcRpm");
+      if (lcRpmEl) {
+        lcRpmEl.textContent = rpmStr;
+        lcRpmEl.className = "tft-rpm-val" + (isRed ? " redline" : "");
+      }
+      const nRpmEl = $("nRpm");
+      if (nRpmEl) {
+        nRpmEl.textContent = rpmStr;
+        nRpmEl.className = "hero-rpm-val" + (isRed ? " redline" : "");
+      }
+      const lnRpmEl = $("lnRpm");
+      if (lnRpmEl) {
+        lnRpmEl.textContent = rpmStr;
+        lnRpmEl.className = "lhud-nerdy-rpm" + (isRed ? " redline" : "");
+      }
+
+      if ($("cSpeedNum")) $("cSpeedNum").textContent = vssStr;
+      if ($("lcSpeedNum")) $("lcSpeedNum").textContent = vssStr;
+      if ($("nVssNum")) $("nVssNum").textContent = vssStr;
+
+      if ($("cTpsNum")) $("cTpsNum").textContent = tpsStr;
+      if ($("lcTpsNum")) $("lcTpsNum").textContent = tpsStr;
+      if ($("nTpsNum")) $("nTpsNum").textContent = String(Math.round(t));
+      if ($("lnTpsNum")) $("lnTpsNum").textContent = tpsStr;
+    }
+
+    const stillMoving =
+      Math.abs(anim.targetRpm - anim.dispRpm) >= 6 ||
+      Math.abs(anim.targetVss - anim.dispVss) >= 0.25 ||
+      Math.abs(anim.targetTps - anim.dispTps) >= 0.3;
+
+    if (stillMoving) {
+      anim.rafId = requestAnimationFrame(stepAnimationFrame);
     }
   }
 
-  function renderIdleState() {
-    hasLiveSignal = false;
-    sweepActive = false;
-    latestFrame = null;
-
-    ["cHeroCard", "cSecGrid", "nHeroCard", "nerdySensorGrid", "lGridCasual", "lGridNerdy"].forEach((id) => {
-      $(id).classList.add("is-idle");
-    });
-
-    $("cEmptyChecklist").hidden = false;
-    $("cChartCard").hidden = true;
-
-    ["cRpm", "cPeakHold", "cTpsNum", "cEctNum", "cVbatNum", "cIatNum", "cMapWord",
-     "lcRpm", "lcPeak", "lcTpsNum", "lcEctNum", "lcBatNum", "lcIatNum", "lcMapWord",
-     "nRpm", "nPeakRpm", "nDutyTop", "nTpsNum", "nMapNum", "nInjNum", "nIgnNum",
-     "nO2Num", "nIacvNum", "nEctNum", "nIatNum", "nVbatNum", "nVssNum",
-     "lnRpm", "lnPeak", "lnTpsNum", "lnDuty", "lnInjNum", "lnIgnNum", "lnEctNum",
-     "lnBatNum", "lnMapNum", "lnAfrNum", "lnIacvNum", "lnIatNum"].forEach((id) => {
-      $(id).textContent = "--";
-    });
-    $("cSpeedNum").textContent = "0";
-    $("lcSpeedNum").textContent = "0";
-    $("lcVssPeak").textContent = "--";
-    $("cGearVal").textContent = "N";
-    $("cGearVal").className = "gear-val is-neutral";
-    $("lcGearVal").textContent = "N";
-    $("lcGearVal").className = "gear-val is-neutral";
-    $("cGearSub").textContent = "MO · NEUTRAL";
-    $("lcGearSub").textContent = "MO · NEUTRAL";
-    $("cEctFill").style.width = "0%";
-    $("lcEctFill").style.width = "0%";
-    $("cVbatFill").style.width = "0%";
-    $("lcBatFill").style.width = "0%";
-    if ($("lcFuelFill")) $("lcFuelFill").style.width = "71%";
-    if ($("lcFuelNum")) $("lcFuelNum").textContent = "71";
-    if ($("lcRpmSweep")) $("lcRpmSweep").style.width = "0%";
-    if ($("lcModeBadge")) $("lcModeBadge").textContent = replayRunning ? "SIM" : (btConnected ? (usbConnected ? "USB" : "LIVE") : "IDLE");
-    const dNow = new Date();
-    const timeStr = String(dNow.getHours()).padStart(2, "0") + ":" + String(dNow.getMinutes()).padStart(2, "0");
-    $("lcTimeTxt").textContent = timeStr;
-    $("lcTripTxt").textContent = (tripMeters / 1000).toFixed(1);
-    $("lcOdoTxt").textContent = Math.floor(odoMeters / 1000).toLocaleString("en-US");
-
-    $("cTpsMaxChip").textContent = "Max --%";
-    $("lcTpsMax").textContent = "Max --%";
-    $("cEctSub").textContent = "Chờ tín hiệu";
-    $("cVbatSub").textContent = "Min đề: -- V";
-    $("cMapKpaSub").textContent = "";
-    $("cMapSub").textContent = "Áp suất cổ hút";
-    $("lcEctSub").textContent = "Chờ tín hiệu";
-    $("lcBatSub").textContent = "Min đề: -- V";
-    $("lcMapSub").textContent = "";
-    $("nTpsVolt").textContent = "-- V";
-    $("lnTpsVolt").textContent = "-- V";
-    $("cTpsFill").style.width = "0%";
-    $("cTpsBgSweep").style.width = "0%";
-    $("lcTpsFill").style.width = "0%";
-    $("lcTpsBgSweep").style.width = "0%";
-    $("nTpsFill").style.width = "0%";
-    $("lnTpsFill").style.width = "0%";
-    $("lnTpsBgSweep").style.width = "0%";
-
-    $("cHealthDot").className = "conn-dot";
-    $("cHealthText").textContent = "Sẵn sàng kết nối · Bật khóa xe hoặc chạy Demo";
-    $("lBannerTxt").textContent = "Bật khóa xe hoặc chạy Demo";
-
-    updateLeds(ledsCasual, 0, 0);
-    updateLeds(ledsNerdy, 0, 0);
-    updateLeds(ledsLand, 0, 0);
-  }
-
-  // Startup Gauge Sweep Animation (0 -> 12,000 -> live)
-  function startGaugeSweep(targetFrame) {
-    sweepActive = true;
-    sweepStartTs = performance.now();
-    const duration = 650;
-
-    function tick(now) {
-      if (!hasLiveSignal || !sweepActive) return;
-      const t = Math.min(1, (now - sweepStartTs) / duration);
-      let sRpm = 0;
-      let sTps = 0;
-      const liveRpm = latestFrame ? latestFrame.rpm : targetFrame.rpm;
-      const liveTps = latestFrame ? latestFrame.tpsPct : targetFrame.tpsPct;
-      if (t < 0.5) {
-        const p = t / 0.5;
-        sRpm = Math.round(p * MAX_RPM_SCALE);
-        sTps = Math.round(p * 100);
-      } else {
-        const p = (t - 0.5) / 0.5;
-        sRpm = Math.round(MAX_RPM_SCALE - p * (MAX_RPM_SCALE - liveRpm));
-        sTps = Math.round(100 - p * (100 - liveTps));
-      }
-
-      const rpmS = sRpm.toLocaleString("en-US");
-      const tpsW = sTps + "%";
-      $("cRpm").textContent = rpmS;
-      $("lcRpm").textContent = rpmS;
-      $("nRpm").textContent = rpmS;
-      $("lnRpm").textContent = rpmS;
-      $("cTpsNum").textContent = String(sTps);
-      $("lcTpsNum").textContent = String(sTps);
-      $("cTpsFill").style.width = tpsW;
-      $("cTpsBgSweep").style.width = tpsW;
-      $("lcTpsFill").style.width = tpsW;
-      $("lcTpsBgSweep").style.width = tpsW;
-      updateLeds(ledsCasual, sRpm, 0);
-      updateLeds(ledsNerdy, sRpm, 0);
-      updateLeds(ledsLand, sRpm, 0);
-
-      if (t < 1) {
-        requestAnimationFrame(tick);
-      } else {
-        sweepActive = false;
-        if (latestFrame) applyFrame(latestFrame);
-      }
+  function kickAnimLoop() {
+    if (!anim.rafId && !document.hidden) {
+      anim.lastRafMs = performance.now();
+      anim.rafId = requestAnimationFrame(stepAnimationFrame);
     }
-    requestAnimationFrame(tick);
   }
 
-  function syncModeAndTabs() {
-    localStorage.setItem("kline_ui_mode", uiMode);
-    const label = uiMode === "nerdy" ? "NERDY" : "CASUAL";
-    [$("pBtnModeCycle"), $("lBtnModeCycle")].forEach((b) => {
-      b.textContent = label;
-      b.classList.toggle("is-nerdy", uiMode === "nerdy");
-    });
-
-    const targetTab = uiMode === "casual" ? activeCasualTab : activeNerdyTab;
-    document.querySelectorAll(".page").forEach((p) => {
-      p.hidden = !(p.dataset.mode === uiMode && p.dataset.tab === targetTab);
-    });
-    document.querySelectorAll(".bnav-btn").forEach((b) => {
-      const isMode = b.dataset.mode === uiMode;
-      b.hidden = !isMode;
-      b.classList.toggle("active", isMode && b.dataset.tab === targetTab);
-    });
-
-    $("lGridCasual").hidden = uiMode !== "casual";
-    $("lGridNerdy").hidden = uiMode !== "nerdy";
-
-    if (uiMode === "casual" && activeCasualTab === "overview" && hasLiveSignal) drawOverviewChart();
-    if (uiMode === "nerdy" && activeNerdyTab === "scope") drawScope();
-    if (uiMode === "nerdy" && activeNerdyTab === "dyno") renderMapTable();
-  }
-
-  function toggleMode() {
-    uiMode = uiMode === "casual" ? "nerdy" : "casual";
-    syncModeAndTabs();
-  }
-  $("pBtnModeCycle").addEventListener("click", toggleMode);
-  $("lBtnModeCycle").addEventListener("click", toggleMode);
-
-  document.querySelectorAll(".bnav-btn").forEach((b) => {
-    b.addEventListener("click", () => {
-      if (b.dataset.mode === "casual") activeCasualTab = b.dataset.tab;
-      else activeNerdyTab = b.dataset.tab;
-      syncModeAndTabs();
-    });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) kickAnimLoop();
   });
 
-  function setStatus(dotClass, text) {
-    $("pConnDot").className = "conn-dot " + dotClass;
-    $("lConnDot").className = "conn-dot " + dotClass;
-    $("pConnText").textContent = text;
-    $("lConnText").textContent = text;
+  /* ── IDLE & RESET RENDERERS ── */
+  function renderIdleState() {
+    hasLiveData = false;
+    anim.targetRpm = 0;
+    anim.targetVss = 0;
+    anim.targetTps = 0;
+    kickAnimLoop();
+
+    if ($("cHeroCard")) $("cHeroCard").classList.add("is-idle");
+    if ($("nHeroCard")) $("nHeroCard").classList.add("is-idle");
+    if ($("cEmptyChecklist")) $("cEmptyChecklist").classList.remove("hidden");
+    if ($("cChartCard")) $("cChartCard").classList.add("hidden");
+
+    const cGear = $("cGearVal");
+    if (cGear) {
+      cGear.textContent = "-";
+      cGear.className = "gear-cap-val gear-N";
+    }
+    const lcGear = $("lcGearVal");
+    if (lcGear) {
+      lcGear.textContent = "-";
+      lcGear.className = "tft-gear-digit gear-N";
+    }
+
+    const modelState = gearTracker.getModel();
+    const gLabel = modelState.isCalibrated ? "Đã học" : "Mặc định";
+    if ($("cGearSub")) $("cGearSub").textContent = gLabel;
+    if ($("lcGearSub")) $("lcGearSub").textContent = gLabel;
+
+    if ($("cEctNum")) { $("cEctNum").textContent = "--"; $("cEctNum").className = "metric-val"; }
+    if ($("cEctSub")) $("cEctSub").textContent = "Chờ ECU";
+    setScaleX("cEctFill", 0);
+    setScaleX("lcEctFill", 0);
+
+    if ($("cVbatNum")) { $("cVbatNum").textContent = "--"; $("cVbatNum").className = "metric-val"; }
+    if ($("cVbatSub")) $("cVbatSub").textContent = "Chờ ECU";
+    setScaleX("cVbatFill", 0);
+    setScaleX("lcBatFill", 0);
+
+    if ($("cIatNum")) $("cIatNum").textContent = "--";
+    if ($("cMapWord")) $("cMapWord").textContent = "--";
+    if ($("cMapKpaSub")) $("cMapKpaSub").textContent = "kPa";
+    if ($("cMapSub")) $("cMapSub").textContent = "Cổ hút";
+
+    if ($("lcEctNum")) { $("lcEctNum").textContent = "--"; $("lcEctNum").className = "lhud-mini-val"; }
+    if ($("lcEctSub")) $("lcEctSub").textContent = "Chờ";
+    if ($("lcBatNum")) { $("lcBatNum").textContent = "--"; $("lcBatNum").className = "lhud-mini-val"; }
+    if ($("lcBatSub")) $("lcBatSub").textContent = "Chờ";
+    if ($("lcIatNum")) $("lcIatNum").textContent = "--";
+    if ($("lcMapWord")) $("lcMapWord").textContent = "--";
+    if ($("lcMapSub")) $("lcMapSub").textContent = "--";
+
+    if ($("casualBanner")) $("casualBanner").className = "status-banner ok";
+    if ($("cHealthDot")) $("cHealthDot").className = "status-dot";
+    if ($("cHealthText")) $("cHealthText").textContent = "CHỜ TÍN HIỆU ECU...";
+    if ($("lBannerTxt")) $("lBannerTxt").textContent = "K-LINE READY";
   }
 
-  function setBtBtnState(kind) {
-    [$("pBtnBt"), $("lBtnBt")].forEach((b) => {
-      b.className = "btn btn--touch btn--bt" + (kind ? " is-" + kind : "");
+  /* ── NAVIGATION & MODE SYNC ── */
+  function syncModeAndPages(targetPage) {
+    if (targetPage) currentPage = targetPage;
+    uiMode = currentPage.startsWith("nerdy-") ? "nerdy" : "casual";
+
+    document.body.dataset.page = currentPage;
+    document.body.classList.toggle("mode-nerdy", uiMode === "nerdy");
+    document.body.classList.toggle("mode-casual", uiMode === "casual");
+
+    document.querySelectorAll(".page").forEach((p) => {
+      p.classList.toggle("active", p.id === "page-" + currentPage);
     });
-  }
 
-  function updateFiLamp() {
-    [$("pBtnFi"), $("lBtnFi")].forEach((b) => {
-      b.classList.toggle("has-fault", faultCount > 0);
+    document.querySelectorAll(".bnav-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.page === currentPage);
     });
-  }
 
-  function openFiDiagnostics() {
-    const isLandscape = window.innerWidth > window.innerHeight && window.innerHeight <= 540;
-    if (!isLandscape) {
-      if (uiMode === "casual") activeCasualTab = "dtc";
-      else activeNerdyTab = "lab";
-      syncModeAndTabs();
-    } else {
-      $("fiModal").hidden = false;
+    const isNerdy = uiMode === "nerdy";
+    if ($("lGridCasual")) $("lGridCasual").classList.toggle("hidden", isNerdy);
+    if ($("lGridNerdy")) $("lGridNerdy").classList.toggle("hidden", !isNerdy);
+    if ($("lcModeBadge")) $("lcModeBadge").textContent = isNerdy ? "NERDY" : "CASUAL";
+
+    const modeTxt = isNerdy ? "CASUAL" : "RACE";
+    if ($("pBtnModeCycle")) $("pBtnModeCycle").textContent = modeTxt;
+    if ($("lBtnModeCycle")) $("lBtnModeCycle").textContent = modeTxt;
+
+    if (currentPage === "casual-overview") drawOverviewChart();
+    if (currentPage === "casual-trip") renderSessionFiles();
+    if (currentPage === "nerdy-tuning") {
+      drawScope();
+      renderMapTable();
+    }
+    if (currentPage === "nerdy-lab") {
+      renderGearLearnerUi();
+      renderDebugConsole();
     }
   }
-  $("pBtnFi").addEventListener("click", openFiDiagnostics);
-  $("lBtnFi").addEventListener("click", openFiDiagnostics);
-  $("btnCloseFiModal").addEventListener("click", () => { $("fiModal").hidden = true; });
 
-  function updateMinMax(key, val, fmtFn, dotId, lblId, loBound, hiBound) {
-    if (!minmax[key]) minmax[key] = { min: val, max: val };
-    else {
-      if (val < minmax[key].min) minmax[key].min = val;
-      if (val > minmax[key].max) minmax[key].max = val;
+  function updateConnIndicators(state, message) {
+    connState = state || "disconnected";
+    const mapTxt = {
+      connected: "ĐÃ KẾT NỐI",
+      connecting: "ĐANG KẾT NỐI...",
+      disconnected: "CHƯA KẾT NỐI"
+    };
+    const dotCls = state === "connected" ? "ok" : state === "connecting" ? "warn" : "";
+    const txt = message && message.length <= 28 ? message : mapTxt[connState] || "CHƯA KẾT NỐI";
+
+    if ($("pConnDot")) $("pConnDot").className = "conn-dot " + dotCls;
+    if ($("lConnDot")) $("lConnDot").className = "conn-dot " + dotCls;
+    if ($("pConnText")) $("pConnText").textContent = txt;
+    if ($("lConnText")) $("lConnText").textContent = txt;
+    if ($("btModalStatus")) $("btModalStatus").textContent = message || txt;
+
+    const btCls = state === "connected" ? " is-ok" : state === "connecting" ? " is-warn" : "";
+    if ($("pBtnBt")) $("pBtnBt").className = "top-chip link-chip" + btCls;
+    if ($("lBtnBt")) $("lBtnBt").className = "lhud-link-pill" + btCls;
+
+    if ($("chkBtDot")) $("chkBtDot").className = "chk-dot " + dotCls;
+    if ($("chkBtTxt")) {
+      $("chkBtTxt").textContent = state === "connected"
+        ? "1. Đã kết nối K-Line Hardware (" + txt + ")"
+        : "1. Kết nối bộ đọc K-Line (USB OTG hoặc Bluetooth)";
     }
-    const r = minmax[key];
-    const span = r.max > r.min ? (r.max - r.min) : Math.max(1, hiBound - loBound);
-    const base = r.max > r.min ? r.min : loBound;
-    const pct = Math.max(0, Math.min(100, ((val - base) / span) * 100));
-    $(dotId).style.left = pct.toFixed(0) + "%";
-    $(lblId).textContent = "MIN " + fmtFn(r.min) + " · MAX " + fmtFn(r.max);
+
+    const fiVisible = faultCount > 0;
+    if ($("pBtnFi")) {
+      $("pBtnFi").classList.toggle("hidden", !fiVisible);
+      $("pBtnFi").classList.toggle("has-fault", fiVisible);
+    }
+    if ($("lBtnFi")) {
+      $("lBtnFi").classList.toggle("hidden", !fiVisible);
+      $("lBtnFi").classList.toggle("has-fault", fiVisible);
+    }
+  }
+
+  /* ── MIN/MAX & 3D MAP & PULL TIMER ── */
+  function updateBound(key, val, unit, dec, dotId, lblId) {
+    if (!Number.isFinite(val)) return;
+    const b = bounds[key];
+    if (b[0] === null || val < b[0]) b[0] = val;
+    if (b[1] === null || val > b[1]) b[1] = val;
+    const f = (n) => (dec === 0 ? String(Math.round(n)) : n.toFixed(dec));
+    const el = $(lblId);
+    if (el) el.textContent = `${f(b[0])} / ${f(b[1])}`;
+    const dot = $(dotId);
+    if (dot) dot.className = "mm-dot ok";
   }
 
   function recordMapCell(d) {
-    if (d.rpm < 600) {
-      activeCellKey = null;
-      return;
-    }
-    let bestR = 0;
-    let bestT = 0;
-    for (let i = 1; i < RPM_BINS.length; i++) {
-      if (Math.abs(RPM_BINS[i] - d.rpm) < Math.abs(RPM_BINS[bestR] - d.rpm)) bestR = i;
-    }
-    for (let i = 1; i < TPS_BINS.length; i++) {
-      if (Math.abs(TPS_BINS[i] - d.tpsPct) < Math.abs(TPS_BINS[bestT] - d.tpsPct)) bestT = i;
-    }
-    activeCellKey = bestT + "_" + bestR;
-    const val = mapMetric === "INJ" ? d.injMs : (mapMetric === "IGN" ? d.ignDeg : d.mapKpa);
-    if (!mapCells[activeCellKey]) mapCells[activeCellKey] = [val, 1];
-    else {
-      mapCells[activeCellKey][0] += val;
-      mapCells[activeCellKey][1] += 1;
-    }
+    const rBin = Math.min(7, Math.max(0, Math.floor(d.rpm / 1500)));
+    const tBin = Math.min(5, Math.max(0, Math.floor(d.tpsPct / 17)));
+    const key = rBin + "_" + tBin;
+    if (!mapCells[key]) mapCells[key] = { n: 0, injSum: 0, ignSum: 0, o2Sum: 0 };
+    const c = mapCells[key];
+    c.n += 1;
+    c.injSum += d.injMs;
+    c.ignSum += d.ignDeg;
+    c.o2Sum += d.o2Volt;
   }
 
   function renderMapTable() {
     const tbl = $("mapTable");
-    let html = "<tr><th>TPS\\R</th>";
-    for (let j = 0; j < RPM_BINS.length; j++) html += "<th>" + (RPM_BINS[j] / 1000) + "k</th>";
-    html += "</tr>";
-    for (let i = TPS_BINS.length - 1; i >= 0; i--) {
-      html += "<tr><th>" + TPS_BINS[i] + "%</th>";
-      for (let j = 0; j < RPM_BINS.length; j++) {
-        const key = i + "_" + j;
-        const entry = mapCells[key];
-        const isAct = key === activeCellKey;
-        const cls = (entry ? "has-data" : "") + (isAct ? " is-active" : "");
-        let txt = "·";
-        if (entry) {
-          const avg = entry[0] / entry[1];
-          txt = mapMetric === "INJ" ? avg.toFixed(1) : avg.toFixed(0);
+    if (!tbl) return;
+    const tCols = ["0%", "17%", "34%", "51%", "68%", "85%"];
+    let html = "<thead><tr><th>RPM\\TPS</th>";
+    for (let t = 0; t < 6; t++) html += `<th>${tCols[t]}</th>`;
+    html += "</tr></thead><tbody>";
+
+    for (let r = 0; r < 8; r++) {
+      html += `<tr><th>${(r * 1.5).toFixed(1)}k</th>`;
+      for (let t = 0; t < 6; t++) {
+        const c = mapCells[r + "_" + t];
+        let txt = "--";
+        let cls = "map-cell";
+        if (c && c.n > 0) {
+          const avg = activeMapMetric === "inj"
+            ? c.injSum / c.n
+            : activeMapMetric === "ign"
+              ? c.ignSum / c.n
+              : c.o2Sum / c.n;
+          txt = avg.toFixed(activeMapMetric === "ign" ? 0 : 1);
+          if (activeMapMetric === "inj") cls += avg > 9 ? " hot" : avg > 5.5 ? " warm" : avg > 2.5 ? " mid" : " cool";
+          else if (activeMapMetric === "ign") cls += avg > 32 ? " hot" : avg > 22 ? " warm" : " mid";
+          else cls += avg < 0.35 ? " warm" : avg > 0.7 ? " cool" : " mid";
         }
-        html += '<td class="' + cls + '">' + txt + "</td>";
+        html += `<td class="${cls}">${txt}</td>`;
       }
       html += "</tr>";
     }
+    html += "</tbody>";
     tbl.innerHTML = html;
   }
 
-  function updatePullTimer(rpm, now) {
-    if (rpm < 3800 && (pullState === "IDLE" || pullState === "DONE")) {
-      pullState = "ARMED";
-      $("pullStateTxt").textContent = "SẴN SÀNG! Thốc ga vượt 4,000 RPM";
-    } else if (pullState === "ARMED" && rpm >= 4000) {
-      pullState = "TIMING";
-      pullT0 = now;
-      $("pullStateTxt").textContent = "ĐANG ĐO 4,000 → 9,000 RPM...";
-    } else if (pullState === "TIMING") {
-      const elSec = (now - pullT0) / 1000;
-      $("pullCurTxt").textContent = elSec.toFixed(2) + " s";
-      if (rpm >= 9000) {
-        pullState = "DONE";
-        if (pullBest === null || elSec < pullBest) pullBest = elSec;
-        $("pullStateTxt").textContent = "HOÀN TẤT 4k → 9k";
-        $("pullBestTxt").textContent = "BEST " + pullBest.toFixed(2) + " s";
-      } else if (rpm < 3500) {
-        pullState = "ARMED";
-        $("pullCurTxt").textContent = "--.-- s";
-        $("pullStateTxt").textContent = "HỦY · SẴN SÀNG LẠI";
-      }
-    }
-  }
-
-  function drawOverviewChart() {
-    const c = $("pOverviewChart");
-    if (!c) return;
-    const rect = c.getBoundingClientRect();
-    const w = Math.max(180, Math.floor(rect.width));
-    const h = Math.max(70, Math.floor(rect.height));
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    if (c.width !== w * dpr || c.height !== h * dpr) {
-      c.width = w * dpr;
-      c.height = h * dpr;
-    }
-    const ctx = c.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-
-    ctx.strokeStyle = "rgba(255,255,255,0.06)";
-    ctx.lineWidth = 1;
-    for (const f of [0.25, 0.5, 0.75]) {
-      const y = Math.round(h * f) + 0.5;
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
-    }
-    if (scopeHistory.length < 2) return;
-
-    const pts = scopeHistory.slice(-90);
-    const maxPts = 90;
-    const step = w / (maxPts - 1);
-    const xOff = (maxPts - pts.length) * step;
-
-    ctx.strokeStyle = "#FF4D00";
-    ctx.lineWidth = 1.6;
-    ctx.beginPath();
-    for (let i = 0; i < pts.length; i++) {
-      const x = xOff + i * step;
-      const y = h - 4 - (Math.max(0, Math.min(pts[i].tpsPct, 100)) / 100) * (h - 8);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    ctx.strokeStyle = "#00E5FF";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    for (let i = 0; i < pts.length; i++) {
-      const x = xOff + i * step;
-      const y = h - 4 - (Math.max(0, Math.min(pts[i].rpm, MAX_RPM_SCALE)) / MAX_RPM_SCALE) * (h - 8);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-    ctx.lineTo(w, h);
-    ctx.lineTo(xOff, h);
-    ctx.closePath();
-    const grad = ctx.createLinearGradient(0, 0, 0, h);
-    grad.addColorStop(0, "rgba(0, 229, 255, 0.16)");
-    grad.addColorStop(1, "rgba(0, 229, 255, 0.00)");
-    ctx.fillStyle = grad;
-    ctx.fill();
-  }
-
-  function drawScope() {
-    const c = $("nScopeCanvas");
-    if (!c) return;
-    const rect = c.getBoundingClientRect();
-    const w = Math.max(200, Math.floor(rect.width));
-    const h = Math.max(160, Math.floor(rect.height));
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    if (c.width !== w * dpr || c.height !== h * dpr) {
-      c.width = w * dpr;
-      c.height = h * dpr;
-    }
-    const ctx = c.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-
-    ctx.strokeStyle = "rgba(255,255,255,0.06)";
-    ctx.lineWidth = 1;
-    for (const f of [0.25, 0.5, 0.75]) {
-      const y = Math.round(h * f) + 0.5;
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
-    }
-    if (scopeHistory.length < 2) return;
-    const step = w / (MAX_SCOPE - 1);
-    const xOff = (MAX_SCOPE - scopeHistory.length) * step;
-
-    const chs = [
-      [scopeEnabled.map, "mapKpa", 120, "#38BDF8", 1.5],
-      [scopeEnabled.inj, "injMs", 12, "#FFA800", 1.5],
-      [scopeEnabled.o2, "o2Volt", 1.2, "#22C55E", 1.5],
-      [scopeEnabled.tps, "tpsPct", 100, "#FF4D00", 1.8],
-      [scopeEnabled.rpm, "rpm", MAX_RPM_SCALE, "#00E5FF", 2.0]
-    ];
-    for (const [on, key, maxV, col, lw] of chs) {
-      if (!on) continue;
-      ctx.strokeStyle = col;
-      ctx.lineWidth = lw;
-      ctx.beginPath();
-      for (let i = 0; i < scopeHistory.length; i++) {
-        const x = xOff + i * step;
-        const y = h - 6 - (Math.max(0, Math.min(scopeHistory[i][key], maxV)) / maxV) * (h - 12);
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    }
-
-    if (scopeHoverIdx !== null && scopeHoverIdx >= 0 && scopeHoverIdx < scopeHistory.length) {
-      const hx = xOff + scopeHoverIdx * step;
-      ctx.strokeStyle = "#FF4D00";
-      ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(hx, 0); ctx.lineTo(hx, h); ctx.stroke();
-      const s = scopeHistory[scopeHoverIdx];
-      $("scopeCursorReadout").textContent =
-        "RPM " + s.rpm + " | TPS " + s.tpsPct.toFixed(0) + "% | MAP " + s.mapKpa + " | INJ " + s.injMs.toFixed(2) + "ms | O2 " + s.o2Volt.toFixed(2) + "V";
-    }
-  }
-
-  function scrubScopeAt(clientX) {
-    if (!scopeHistory.length) return;
-    const rect = $("nScopeCanvas").getBoundingClientRect();
-    const step = rect.width / (MAX_SCOPE - 1);
-    const xOff = (MAX_SCOPE - scopeHistory.length) * step;
-    const idx = Math.round((clientX - rect.left - xOff) / step);
-    if (idx >= 0 && idx < scopeHistory.length) {
-      scopeHoverIdx = idx;
-      drawScope();
-    }
-  }
-
-  const sc = $("nScopeCanvas");
-  sc.addEventListener("touchstart", (e) => { e.preventDefault(); scrubScopeAt(e.touches[0].clientX); }, { passive: false });
-  sc.addEventListener("touchmove", (e) => { e.preventDefault(); scrubScopeAt(e.touches[0].clientX); }, { passive: false });
-  sc.addEventListener("mousedown", (e) => scrubScopeAt(e.clientX));
-  sc.addEventListener("mousemove", (e) => { if (e.buttons) scrubScopeAt(e.clientX); });
-
-  function ectSemanticClass(ect) {
-    if (ect > 105) return "hot";
-    if (ect < 55) return "cold";
-    if (ect <= 98) return "ok";
-    return "warn";
-  }
-
-  function batSemanticClass(vbat, rpm) {
-    if (vbat < 11.8) return rpm > 1000 ? "hot" : "warn";
-    if (vbat >= 13.3) return "ok";
-    return "";
-  }
-
-  function applyFrame(d) {
-    latestFrame = d;
-    if (!hasLiveSignal) {
-      hasLiveSignal = true;
-      ["cHeroCard", "cSecGrid", "nHeroCard", "nerdySensorGrid", "lGridCasual", "lGridNerdy"].forEach((id) => {
-        $(id).classList.remove("is-idle");
-      });
-      $("cEmptyChecklist").hidden = true;
-      $("cChartCard").hidden = false;
-      $("chkEcuDot").className = "conn-dot ok";
-      $("chkEcuTxt").textContent = "Đang nhận dữ liệu ECU";
-      startGaugeSweep(d);
-    }
-
+  function updatePullTimer(vss) {
     const now = performance.now();
-    if (lastFrameTs !== null && d.rpm > 300) {
-      const dtRun = Math.min((now - lastFrameTs) / 1000, 1.0);
-      trip.runSec += dtRun;
-      oilHoursBase += dtRun;
-    }
-    lastFrameTs = now;
-    frameCount += 1;
-
-    if (d.rpm > trip.peakRpm) trip.peakRpm = d.rpm;
-    if (d.tpsPct > trip.maxTps) trip.maxTps = d.tpsPct;
-    if (trip.minBat === null || d.vbat < trip.minBat) trip.minBat = d.vbat;
-    if (trip.maxBat === null || d.vbat > trip.maxBat) trip.maxBat = d.vbat;
-    if (maxEctSession === null || d.ectC > maxEctSession) maxEctSession = d.ectC;
-
-    const ectTrend = prevEct === null ? "→" : (d.ectC > prevEct ? "↑" : (d.ectC < prevEct ? "↓" : "→"));
-    prevEct = d.ectC;
-
-    const lowBat = d.rpm > 1000 && d.vbat < 11.8;
-    if (d.ectC > 105 || lowBat) trip.warnCount += 1;
-    if (frameCount % 10 === 0) saveTrip();
-
-    // Non-redundant contextual insight banner (no repeated numbers)
-    let bannerTxt = "Động cơ & hệ thống sạc đang hoạt động ổn định";
-    let bannerDot = "ok";
-    if (d.ectC > 105) { bannerTxt = "Cảnh báo quá nhiệt động cơ! Giảm tải kiểm tra nước mát"; bannerDot = "err"; }
-    else if (lowBat) { bannerTxt = "Hệ thống sạc yếu khi nổ máy — Kiểm tra sạc/bình"; bannerDot = "warn"; }
-    else if (d.rpm === 0) {
-      bannerTxt = d.vbat >= 12.0 ? "Bật khóa chờ đề · Điện bình khỏe, sẵn sàng nổ máy" : "Bật khóa chờ đề · Bình hơi yếu, nên kiểm tra sạc";
-      bannerDot = d.vbat >= 12.0 ? "" : "warn";
-    }
-    else if (d.ectC < 55) { bannerTxt = "Động cơ còn nguội — Giữ ga đều chờ ấm máy"; bannerDot = "cold"; }
-
-    $("cHealthDot").className = "conn-dot " + bannerDot;
-    $("cHealthText").textContent = bannerTxt;
-    $("lBannerTxt").textContent = bannerTxt;
-
-    const rpmTxt = d.rpm.toLocaleString("en-US");
-    const peakTxt = trip.peakRpm.toLocaleString("en-US");
-    const tpsInt = d.tpsPct.toFixed(0);
-    const tpsW = Math.min(100, Math.max(0, d.tpsPct)).toFixed(1) + "%";
-    const ectCls = ectSemanticClass(d.ectC);
-    const batCls = batSemanticClass(d.vbat, d.rpm);
-    const isRed = d.rpm >= redlineRpm;
-    const minBatTxt = (trip.minBat !== null ? trip.minBat.toFixed(1) : d.vbat.toFixed(1));
-    const ectBadge = d.ectC > 105 ? "Nóng!" : (d.ectC < 55 ? "Nguội" : "Chuẩn");
-    const batBadge = d.vbat >= 13.3 ? "Sạc tốt" : (d.vbat < 11.8 ? "Yếu" : "Khá");
-    const loadWord = d.rpm === 0 ? "Nghỉ" : (d.mapKpa >= 75 ? "Nặng" : (d.mapKpa >= 48 ? "Vừa" : "Nhẹ"));
-
-    if (!sweepActive) {
-      $("cRpm").textContent = rpmTxt;
-      $("cRpm").className = "hero-num" + (isRed ? " redline" : "");
-      $("lcRpm").textContent = rpmTxt;
-      $("lcRpm").className = "hero-num hero-num--hud" + (isRed ? " redline" : "");
-      $("nRpm").textContent = rpmTxt;
-      $("nRpm").className = "hero-num hero-num--sm" + (isRed ? " redline" : "");
-      $("lnRpm").textContent = rpmTxt;
-      $("lnRpm").className = "hero-num hero-num--hud-sm" + (isRed ? " redline" : "");
-
-      $("cTpsNum").textContent = tpsInt;
-      $("cTpsFill").style.width = tpsW;
-      $("cTpsBgSweep").style.width = tpsW;
-      $("lcTpsNum").textContent = tpsInt;
-      $("lcTpsFill").style.width = tpsW;
-      $("lcTpsBgSweep").style.width = tpsW;
-
-      updateLeds(ledsCasual, d.rpm, trip.peakRpm);
-      updateLeds(ledsNerdy, d.rpm, trip.peakRpm);
-      updateLeds(ledsLand, d.rpm, trip.peakRpm);
-    }
-
-    // Casual Portrait + Landscape Plain Vietnamese Metrics
-    $("cPeakHold").textContent = peakTxt;
-    $("cTpsMaxChip").textContent = "Max " + trip.maxTps.toFixed(0) + "%";
-    $("cEctNum").textContent = String(d.ectC);
-    $("cEctNum").className = "num " + ectCls;
-    $("cEctSub").textContent = ectBadge + " " + ectTrend + " · Đỉnh " + maxEctSession + "°C";
-    $("cVbatNum").textContent = d.vbat.toFixed(1);
-    $("cVbatNum").className = "num " + batCls;
-    $("cVbatSub").textContent = batBadge + " · Min đề " + minBatTxt + "V";
-    $("cIatNum").textContent = String(d.iatC);
-    $("cMapWord").textContent = loadWord;
-    $("cMapKpaSub").textContent = d.mapKpa + " kPa";
-    $("cMapSub").textContent = d.rpm === 0 ? "Áp suất khí quyển" : "Chân không cổ hút";
-
-    $("lcPeak").textContent = peakTxt;
-    $("lcTpsMax").textContent = "Max " + trip.maxTps.toFixed(0) + "%";
-    $("lcEctNum").textContent = String(d.ectC);
-    $("lcEctNum").className = "num num--sm " + ectCls;
-    $("lcEctSub").textContent = ectBadge + " " + ectTrend + " · Đỉnh " + maxEctSession + "°";
-    $("lcBatNum").textContent = d.vbat.toFixed(1);
-    $("lcBatNum").className = "num num--sm " + batCls;
-    $("lcBatSub").textContent = "Min đề " + minBatTxt + "V";
-    $("lcIatNum").textContent = String(d.iatC);
-    $("lcMapWord").textContent = loadWord;
-    $("lcMapSub").textContent = d.mapKpa + " kPa";
-
-    // TFT Motorsport Cockpit Updates (Speedometer & Gear Box & Dual Gauge Bars)
-    const speedKmh = Math.round(d.vssKmh || 0);
-    if (!trip.peakVss || d.vssKmh > trip.peakVss) trip.peakVss = d.vssKmh;
-    const gearStr = calculateGear(d.rpm, d.vssKmh);
-
-    $("cSpeedNum").textContent = String(speedKmh);
-    $("lcSpeedNum").textContent = String(speedKmh);
-    $("lcVssPeak").textContent = String(Math.round(trip.peakVss || d.vssKmh));
-
-    $("cGearVal").textContent = gearStr;
-    $("lcGearVal").textContent = gearStr;
-
-    let gearClass = "gear-val";
-    let gearSubText = "MO · NEUTRAL";
-    if (gearStr === "N") {
-      gearClass += " is-neutral";
-      gearSubText = "MO · NEUTRAL";
-    } else if (gearStr === "--") {
-      gearClass += " is-waiting";
-      gearSubText = "BÓP CÔN / CHỜ";
-    } else {
-      gearClass += " is-gear";
-      gearSubText = "SỐ " + gearStr;
-    }
-    $("cGearVal").className = gearClass;
-    $("lcGearVal").className = gearClass;
-    $("cGearSub").textContent = gearSubText;
-    $("lcGearSub").textContent = gearSubText;
-
-    const ectPct = Math.max(0, Math.min(100, ((d.ectC - 40) / 80) * 100));
-    const batPct = Math.max(0, Math.min(100, ((d.vbat - 10.5) / 4.0) * 100));
-    $("cEctFill").style.width = ectPct.toFixed(1) + "%";
-    $("lcEctFill").style.width = ectPct.toFixed(1) + "%";
-    $("cVbatFill").style.width = batPct.toFixed(1) + "%";
-    $("lcBatFill").style.width = batPct.toFixed(1) + "%";
-
-    const rpmSweepPct = Math.min(100, Math.max(0, (d.rpm / MAX_RPM_SCALE) * 100));
-    if ($("lcRpmSweep")) $("lcRpmSweep").style.width = rpmSweepPct.toFixed(1) + "%";
-    const fuelPct = Math.max(10, Math.min(100, Math.round(((d.vbat - 11.2) / 1.6) * 100)));
-    if ($("lcFuelFill")) $("lcFuelFill").style.width = fuelPct + "%";
-    if ($("lcFuelNum")) $("lcFuelNum").textContent = String(fuelPct);
-    if ($("lcModeBadge")) $("lcModeBadge").textContent = replayRunning ? "SIM" : (usbConnected ? "USB" : "LIVE");
-
-    updateOdometer(d.vssKmh);
-    const dNow = new Date();
-    const timeStr = String(dNow.getHours()).padStart(2, "0") + ":" + String(dNow.getMinutes()).padStart(2, "0");
-    $("lcTimeTxt").textContent = timeStr;
-    $("lcTripTxt").textContent = (tripMeters / 1000).toFixed(1);
-    $("lcOdoTxt").textContent = Math.floor(odoMeters / 1000).toLocaleString("en-US");
-
-    // Casual Trip Tab
-    const m = Math.floor(trip.runSec / 60);
-    const s = Math.floor(trip.runSec % 60);
-    $("tRunTime").textContent = String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
-    $("tPeakRpm").textContent = peakTxt;
-    $("tMaxTpsNum").textContent = trip.maxTps.toFixed(0);
-    $("tWarnCount").textContent = String(trip.warnCount);
-    $("tMinBat").textContent = minBatTxt + " V";
-    $("tMaxBat").textContent = (trip.maxBat !== null ? trip.maxBat.toFixed(1) : d.vbat.toFixed(1)) + " V";
-    $("tBatVerdict").textContent = trip.minBat !== null && trip.minBat < 9.5 ? "Sụt sâu lúc đề (kiểm tra bình)" : "Bình & sạc ổn định";
-    const oilHrs = oilHoursBase / 3600;
-    $("tOilText").textContent = oilHrs.toFixed(1) + " / 25.0 giờ";
-    $("tOilFill").style.width = Math.min(100, (oilHrs / 25) * 100).toFixed(1) + "%";
-
-    // Nerdy Portrait Sensors
-    $("nPeakRpm").textContent = peakTxt;
-    $("nDutyTop").textContent = d.injDuty.toFixed(1) + "%";
-    $("nDfcoPill").className = "pill-tag" + (d.dfco ? " active" : "");
-
-    $("nTpsNum").textContent = d.tpsPct.toFixed(1);
-    $("nTpsFill").style.width = tpsW;
-    $("nTpsVolt").textContent = d.tpsVolt.toFixed(2) + " V";
-    updateMinMax("tps", d.tpsPct, (v) => v.toFixed(0) + "%", "mmDotTps", "mmLblTps", 0, 100);
-
-    $("nMapNum").textContent = String(d.mapKpa);
-    $("nMapSub").textContent = d.mapVolt.toFixed(2) + " V";
-    updateMinMax("map", d.mapKpa, (v) => v.toFixed(0), "mmDotMap", "mmLblMap", 20, 110);
-
-    $("nInjNum").textContent = d.injMs.toFixed(2);
-    $("nInjNum").className = "num num--sm" + (d.injDuty >= 85 ? " accent" : "");
-    $("nInjSub").textContent = "Duty " + d.injDuty.toFixed(1) + "%";
-    updateMinMax("inj", d.injMs, (v) => v.toFixed(2), "mmDotInj", "mmLblInj", 0, 10);
-
-    const ignS = d.ignDeg > 0 ? "+" : "";
-    $("nIgnNum").textContent = ignS + d.ignDeg.toFixed(1);
-    updateMinMax("ign", d.ignDeg, (v) => v.toFixed(1) + "°", "mmDotIgn", "mmLblIgn", 0, 65);
-
-    $("nO2Num").textContent = d.o2Volt.toFixed(2);
-    $("nO2Sub").textContent = "AFR " + d.afrEst + ":1";
-    updateMinMax("o2", d.o2Volt, (v) => v.toFixed(2), "mmDotO2", "mmLblO2", 0, 1.0);
-
-    $("nIacvNum").textContent = String(d.iacvStp);
-    updateMinMax("iacv", d.iacvStp, (v) => v.toFixed(0), "mmDotIacv", "mmLblIacv", 20, 70);
-
-    $("nEctNum").textContent = String(d.ectC);
-    $("nEctNum").className = "num num--sm " + ectCls;
-    $("nEctSub").textContent = d.ectVolt.toFixed(2) + " V · " + ectTrend;
-    updateMinMax("ect", d.ectC, (v) => v.toFixed(0) + "°", "mmDotEct", "mmLblEct", 25, 115);
-
-    $("nIatNum").textContent = String(d.iatC);
-    $("nIatSub").textContent = d.iatVolt.toFixed(2) + " V";
-    updateMinMax("iat", d.iatC, (v) => v.toFixed(0) + "°", "mmDotIat", "mmLblIat", 20, 60);
-
-    $("nVbatNum").textContent = d.vbat.toFixed(1);
-    $("nVbatNum").className = "num num--sm " + batCls;
-    $("nVbatSub").textContent = "Đề " + minBatTxt + "V";
-    updateMinMax("vbat", d.vbat, (v) => v.toFixed(1) + "V", "mmDotVbat", "mmLblVbat", 8, 15);
-
-    $("nVssNum").textContent = String(d.vssKmh);
-    $("mmLblVss").textContent = "PKT #" + frameCount;
-
-    // Landscape Nerdy HUD
-    $("lnPeak").textContent = peakTxt;
-    $("lnTpsVolt").textContent = d.tpsVolt.toFixed(2) + " V";
-    $("lnTpsNum").textContent = tpsInt;
-    $("lnTpsFill").style.width = tpsW;
-    $("lnTpsBgSweep").style.width = tpsW;
-    $("lnDuty").textContent = d.injDuty.toFixed(0) + "%";
-    $("lnInjNum").textContent = d.injMs.toFixed(2);
-    $("lnIgnNum").textContent = ignS + d.ignDeg.toFixed(0);
-    $("lnEctNum").textContent = String(d.ectC);
-    $("lnEctNum").className = "num num--xs " + ectCls;
-    $("lnEctMax").textContent = "Max " + maxEctSession + "°";
-    $("lnBatNum").textContent = d.vbat.toFixed(1);
-    $("lnBatNum").className = "num num--xs " + batCls;
-    $("lnBatMin").textContent = "Đề " + minBatTxt + "V";
-    $("lnMapNum").textContent = String(d.mapKpa);
-    $("lnAfrNum").textContent = d.afrEst;
-    $("lnIacvNum").textContent = String(d.iacvStp);
-    $("lnIatNum").textContent = String(d.iatC);
-
-    if (!scopeFrozen) {
-      scopeHistory.push(d);
-      if (scopeHistory.length > MAX_SCOPE) scopeHistory.shift();
-    }
-    recordMapCell(d);
-    updatePullTimer(d.rpm, now);
-
-    if (isRecording) {
-      recRows.push([
-        new Date().toISOString(), d.rpm, d.tpsPct, d.tpsVolt.toFixed(2), d.mapKpa,
-        d.ectC, d.iatC, d.vbat, d.injMs.toFixed(2), d.injDuty, d.ignDeg, d.iacvStp, d.o2Volt.toFixed(2), d.vssKmh
-      ].join(","));
-      const sec = Math.floor((Date.now() - recStartMs) / 1000);
-      const tStr = String(Math.floor(sec / 60)).padStart(2, "0") + ":" + String(sec % 60).padStart(2, "0");
-      $("pRecTxt").textContent = tStr;
-      $("lRecTxt").textContent = tStr;
-    }
-
-    if (uiMode === "casual" && activeCasualTab === "overview") drawOverviewChart();
-    if (uiMode === "nerdy" && activeNerdyTab === "scope") drawScope();
-    if (uiMode === "nerdy" && activeNerdyTab === "dyno") renderMapTable();
-  }
-
-  // REC Session Logger
-  function toggleRec() {
-    if (!isRecording) {
-      isRecording = true;
-      recStartMs = Date.now();
-      recRows = ["timestamp,rpm,tps_pct,tps_volt,map_kpa,ect_c,iat_c,vbat,inj_ms,inj_duty,ign_deg,iacv_stp,o2_volt,vss_kmh"];
-      $("pBtnRec").classList.add("is-recording");
-      $("lBtnRec").classList.add("is-recording");
-      $("pRecTxt").textContent = "00:00";
-      $("lRecTxt").textContent = "00:00";
-    } else {
-      isRecording = false;
-      $("pBtnRec").classList.remove("is-recording");
-      $("lBtnRec").classList.remove("is-recording");
-      $("pRecTxt").textContent = "REC";
-      $("lRecTxt").textContent = "REC";
-      if (recRows.length > 1) {
-        const fname = "kline_" + new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-") + ".csv";
-        const content = recRows.join("\n") + "\n";
-        if (window.AndroidBT && window.AndroidBT.saveSessionCsv) {
-          window.AndroidBT.saveSessionCsv(fname, content);
-        }
+    if (pullTimer.state === "idle") {
+      if (vss >= 38 && vss <= 44) {
+        pullTimer.state = "armed";
+        pullTimer.t0 = now;
       }
-      recRows = [];
+    } else if (pullTimer.state === "armed") {
+      if (vss >= 40) {
+        pullTimer.state = "running";
+        pullTimer.t0 = now;
+      } else if (vss < 34) {
+        pullTimer.state = "idle";
+      }
+    } else if (pullTimer.state === "running") {
+      pullTimer.cur = (now - pullTimer.t0) / 1000;
+      if (vss >= 100) {
+        pullTimer.state = "done";
+        if (pullTimer.best === null || pullTimer.cur < pullTimer.best) pullTimer.best = pullTimer.cur;
+      } else if (vss < 25) {
+        pullTimer.state = "idle";
+        pullTimer.cur = 0;
+      }
+    } else if (pullTimer.state === "done" && vss < 30) {
+      pullTimer.state = "idle";
     }
-  }
-  $("pBtnRec").addEventListener("click", toggleRec);
-  $("lBtnRec").addEventListener("click", toggleRec);
 
-  // Replay Controls (Shared Timeline)
-  function fmtSec(secTotal) {
-    const m = Math.floor(secTotal / 60);
-    const s = Math.floor(secTotal % 60);
+    const lblMap = { idle: "CHỜ 40 KM/H", armed: "SẴN SÀNG", running: "ĐANG ĐO!", done: "HOÀN TẤT" };
+    if ($("pullStateTxt")) $("pullStateTxt").textContent = lblMap[pullTimer.state] || "CHỜ";
+    if ($("pullCurTxt")) $("pullCurTxt").textContent = pullTimer.cur.toFixed(2) + "s";
+    if ($("pullBestTxt")) $("pullBestTxt").textContent = pullTimer.best !== null ? pullTimer.best.toFixed(2) + "s" : "--";
+  }
+
+  /* ── TRIP STATS RENDERER ── */
+  function formatClock(sec) {
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
     return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
   }
 
-  function renderReplayAt(idx) {
-    if (!sampleFrames.length) return;
-    replayIndex = Math.max(0, Math.min(idx, sampleFrames.length - 1));
-    const item = sampleFrames[replayIndex];
-    $("replaySlider").value = String(replayIndex);
-    const curSec = Math.floor(replayIndex * 0.1);
-    const totSec = Math.floor(sampleFrames.length * 0.1);
-    $("replayTimeTxt").textContent = fmtSec(curSec) + " / " + fmtSec(totSec);
-    const pkt = parseKlinePacket(item.h);
-    if (pkt && pkt.kind === "table11") applyFrame(pkt);
-  }
+  function renderTripStats() {
+    const runSec = Math.round(tripStats.engineRunSec);
+    if ($("tRunTime")) $("tRunTime").textContent = formatClock(runSec);
+    if ($("lcTimeTxt")) $("lcTimeTxt").textContent = formatClock(runSec);
+    if ($("tPeakRpm")) $("tPeakRpm").innerHTML = `${Math.round(tripStats.peakRpm)} <small>RPM</small>`;
+    if ($("tMaxTpsNum")) $("tMaxTpsNum").innerHTML = `${Math.round(tripStats.peakTps)} <small>%</small>`;
+    if ($("tWarnCount")) $("tWarnCount").textContent = String(tripStats.warnCount);
 
-  function stepReplay() {
-    if (!replayRunning) return;
-    renderReplayAt(replayIndex);
-    replayIndex = (replayIndex + 1) % sampleFrames.length;
-    replayTimer = setTimeout(stepReplay, Math.max(18, Math.floor(100 / replaySpeed)));
-  }
+    const tripKm = tripMeters / 1000;
+    if ($("lcTripTxt")) $("lcTripTxt").textContent = tripKm.toFixed(1) + " km";
+    if ($("lcOdoTxt")) $("lcOdoTxt").textContent = Math.round(odoKm) + " km";
+    if ($("tOilText")) $("tOilText").textContent = `${Math.round(oilKm)} / 1500 km`;
+    setScaleX("tOilFill", Math.min(1, oilKm / 1500));
 
-  // Replay Bar Auto-hide Timer in Landscape Mode
-  let replayAutoHideTimer = null;
-  function triggerReplayAutoHide() {
-    const isLandscape = window.innerWidth > window.innerHeight;
-    if (!isLandscape) return;
-    if (replayAutoHideTimer) clearTimeout(replayAutoHideTimer);
-    replayAutoHideTimer = setTimeout(() => {
-      if (replayRunning && $("sharedReplayBar")) {
-        $("sharedReplayBar").hidden = true;
+    if ($("tMinBat")) $("tMinBat").textContent = tripStats.minVbat !== null ? tripStats.minVbat.toFixed(1) + " V" : "-- V";
+    if ($("tMaxBat")) $("tMaxBat").textContent = tripStats.maxVbat !== null ? tripStats.maxVbat.toFixed(1) + " V" : "-- V";
+
+    const vEl = $("tBatVerdict");
+    if (vEl) {
+      if (tripStats.maxVbat === null) {
+        vEl.textContent = "CHỜ DỮ LIỆU";
+        vEl.className = "pill-tag";
+      } else if (tripStats.minVbat < 10.5) {
+        vEl.textContent = "BÌNH YẾU KHI ĐỀ";
+        vEl.className = "pill-tag warn";
+      } else if (tripStats.maxVbat > 15.1) {
+        vEl.textContent = "QUÁ ÁP SẠC";
+        vEl.className = "pill-tag warn";
+      } else if (tripStats.maxVbat >= 13.4) {
+        vEl.textContent = "SẠC & BÌNH TỐT";
+        vEl.className = "pill-tag ok";
+      } else {
+        vEl.textContent = "BÌNH CHỜ";
+        vEl.className = "pill-tag";
       }
-    }, 4500);
+    }
   }
 
-  function toggleDemo() {
-    if (!sampleFrames.length) return;
-    if (replayRunning || !$("sharedReplayBar").hidden) {
-      replayRunning = false;
-      if (replayTimer) { clearTimeout(replayTimer); replayTimer = null; }
-      if (replayAutoHideTimer) { clearTimeout(replayAutoHideTimer); replayAutoHideTimer = null; }
-      $("sharedReplayBar").hidden = true;
-      $("pBtnDemo").textContent = "Demo";
-      $("lBtnDemo").textContent = "Demo";
-      $("pBtnDemo").classList.remove("is-active");
-      $("lBtnDemo").classList.remove("is-active");
-      setStatus(btConnected ? "ok" : "", btConnected ? (usbConnected ? "USB Online" : "BT Online") : "Chưa kết nối");
-      if ($("lcModeBadge")) $("lcModeBadge").textContent = btConnected ? (usbConnected ? "USB" : "LIVE") : "IDLE";
-      if (!btConnected) renderIdleState();
+  /* ── CANVAS CHARTS (HiDPI Crisp) ── */
+  function resizeCanvasDpr(canvas) {
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width < 10 || rect.height < 10) return null;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const w = Math.round(rect.width * dpr);
+    const h = Math.round(rect.height * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, w: rect.width, h: rect.height };
+  }
+
+  function drawOverviewChart() {
+    const canvas = $("pOverviewChart");
+    const box = resizeCanvasDpr(canvas);
+    if (!box) return;
+    const { ctx, w, h } = box;
+    ctx.clearRect(0, 0, w, h);
+
+    ctx.strokeStyle = "rgba(255,255,255,0.05)";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const y = (h * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+
+    if (history.length < 2) return;
+    const pts = history.slice(-100);
+    const n = pts.length;
+
+    const plotSeries = (getter, maxVal, color, lw) => {
+      ctx.beginPath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lw;
+      for (let i = 0; i < n; i++) {
+        const x = (i / (n - 1)) * w;
+        const y = h - 6 - Math.max(0, Math.min(1, getter(pts[i]) / maxVal)) * (h - 12);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    };
+
+    plotSeries((p) => p.rpm, redlineRpm, "#00E5FF", 2);
+    plotSeries((p) => p.tpsPct, 100, "#FF4D1A", 1.7);
+  }
+
+  function drawScope() {
+    const canvas = $("nScopeCanvas");
+    const box = resizeCanvasDpr(canvas);
+    if (!box) return;
+    const { ctx, w, h } = box;
+    ctx.clearRect(0, 0, w, h);
+
+    ctx.strokeStyle = "rgba(255,255,255,0.05)";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 5; i++) {
+      const y = (h * i) / 5;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+
+    const pts = history.slice(-140);
+    if (pts.length < 2) return;
+
+    const channels = [
+      { key: "rpm", get: (p) => p.rpm / redlineRpm, color: "#00E5FF" },
+      { key: "tps", get: (p) => p.tpsPct / 100, color: "#FF4D1A" },
+      { key: "inj", get: (p) => p.injMs / 18, color: "#00E676" },
+      { key: "ign", get: (p) => Math.max(0, p.ignDeg + 5) / 50, color: "#FFB300" }
+    ];
+
+    channels.forEach((ch) => {
+      if (!scopeEnabled[ch.key]) return;
+      ctx.beginPath();
+      ctx.strokeStyle = ch.color;
+      ctx.lineWidth = 1.7;
+      for (let i = 0; i < pts.length; i++) {
+        const x = (i / (pts.length - 1)) * w;
+        const y = h - 8 - Math.max(0, Math.min(1, ch.get(pts[i]))) * (h - 16);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    });
+
+    if (scopeCursorIdx !== null && pts[scopeCursorIdx]) {
+      const idx = Math.max(0, Math.min(pts.length - 1, scopeCursorIdx));
+      const x = (idx / (pts.length - 1)) * w;
+      const p = pts[idx];
+      ctx.strokeStyle = "rgba(255,255,255,0.4)";
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+      if ($("scopeCursorReadout")) {
+        $("scopeCursorReadout").textContent =
+          `RPM ${p.rpm} | TPS ${Math.round(p.tpsPct)}% | INJ ${p.injMs.toFixed(1)}ms | IGN ${p.ignDeg}°`;
+      }
+    }
+  }
+
+  /* ── GEAR PULL-LEARN UI RENDERER ── */
+  function renderGearLearnerUi() {
+    const st = gearLearner.getStatus();
+    const model = gearTracker.getModel();
+
+    const modeLabels = {
+      idle: "SẴN SÀNG",
+      "pull-1": "ĐANG HỌC SỐ 1",
+      "auto-seq": `ĐANG HỌC SỐ ${st.activeGear}`,
+      single: `CHỈNH SỐ ${st.activeGear}`
+    };
+
+    let statusText = 'Chọn "Học Số 1 (Kéo Max Tua)" rồi vào số 1 kéo ga đều.';
+    if (st.mode === "pull-1") {
+      statusText = st.ready
+        ? `Đủ mẫu sạch (${st.sampleCount}) · Peak ${st.maxRpmSeen} RPM. Nhấn "Chốt Ratio & Lưu" để tự tính số 2–6!`
+        : `Vào số 1 & kéo lên tua cao (> 2200 RPM, > 6 km/h)... Hiện có ${st.sampleCount} mẫu.`;
+    } else if (st.mode === "auto-seq") {
+      statusText = `Chạy lần lượt số 1→6 (${st.seqLockedCount}/6 số đã ghi nhận, Ratio hiện tại: ${st.liveRatio ? st.liveRatio.toFixed(1) : "--"}).`;
+    } else if (st.mode === "single") {
+      statusText = `Chạy ổn định ở số ${st.activeGear} (Ratio hiện tại: ${st.liveRatio ? st.liveRatio.toFixed(1) : "--"}), xong nhấn Chốt.`;
+    }
+
+    const metaText = `N=${st.sampleCount} · Peak ${st.maxRpmSeen} RPM · R=${st.liveRatio ? st.liveRatio.toFixed(1) : "--"}`;
+
+    if ($("learnLiveBanner")) $("learnLiveBanner").classList.toggle("is-learning", st.mode !== "idle");
+    if ($("learnModeBadge")) $("learnModeBadge").textContent = modeLabels[st.mode] || "SẴN SÀNG";
+    if ($("learnStatusTxt")) $("learnStatusTxt").textContent = statusText;
+    if ($("learnSampleMeta")) $("learnSampleMeta").textContent = metaText;
+    if ($("learnConfirmRow")) $("learnConfirmRow").classList.toggle("hidden", st.mode === "idle");
+
+    if ($("mLearnBadge")) $("mLearnBadge").textContent = modeLabels[st.mode] || "SẴN SÀNG";
+    if ($("mLearnStatus")) $("mLearnStatus").textContent = statusText;
+    if ($("mLearnMeta")) $("mLearnMeta").textContent = metaText;
+    if ($("mLearnConfirmRow")) $("mLearnConfirmRow").classList.toggle("hidden", st.mode === "idle");
+
+    document.querySelectorAll(".gear-learn-btn").forEach((btn) => {
+      const g = parseInt(btn.dataset.learnGear, 10);
+      btn.classList.toggle("active", st.mode !== "idle" && st.activeGear === g);
+    });
+
+    const grid = $("gearRatiosGrid");
+    if (grid) {
+      grid.innerHTML = model.ratios.map((ratio, idx) => {
+        const src = model.sources[idx] || "default";
+        const tag = src === "learned" ? "ĐÃ HỌC" : src === "derived" ? "TỪ SỐ 1" : "MẶC ĐỊNH";
+        const cls = src === "learned" ? "locked" : src === "derived" ? "derived" : "";
+        return `<div class="learn-ratio-pill ${cls}"><strong>G${idx + 1} · ${ratio.toFixed(1)}</strong><span>${tag}</span></div>`;
+      }).join("");
+    }
+  }
+
+  /* ── DEBUG CONSOLE RENDERER ── */
+  function renderDebugConsole() {
+    const out = $("lAppDebugOut");
+    if (!out) return;
+    let lines = [...jsDebugBuffer];
+    if (hasBridge() && typeof window.AndroidBT.getAppDebugLogs === "function") {
+      try {
+        const nativeLogs = window.AndroidBT.getAppDebugLogs();
+        if (nativeLogs) lines = nativeLogs.split("\n").concat(lines).slice(-140);
+      } catch (_) {}
+    }
+    out.textContent = lines.length ? lines.join("\n") : "Chưa có log lỗi nào (hệ thống ổn định).";
+    out.scrollTop = out.scrollHeight;
+  }
+
+  /* ── APPLY LIVE TELEMETRY FRAME ── */
+  function applyFrame(d) {
+    lastFrame = d;
+    lastFramePerf = performance.now();
+
+    if (!hasLiveData) {
+      hasLiveData = true;
+      if ($("cHeroCard")) $("cHeroCard").classList.remove("is-idle");
+      if ($("nHeroCard")) $("nHeroCard").classList.remove("is-idle");
+      if ($("cEmptyChecklist")) $("cEmptyChecklist").classList.add("hidden");
+      if ($("cChartCard")) $("cChartCard").classList.remove("hidden");
+      if ($("chkEcuDot")) $("chkEcuDot").className = "chk-dot ok";
+      if ($("chkEcuTxt")) $("chkEcuTxt").textContent = "2. ECU đang gửi dữ liệu Table 11";
+      requestAnimationFrame(() => drawOverviewChart());
+    }
+
+    const nowMs = Date.now();
+    if (d.rpm > 400) {
+      if (tripStats.lastRunTickMs > 0) {
+        const deltaSec = Math.min(2.0, (nowMs - tripStats.lastRunTickMs) / 1000);
+        tripStats.engineRunSec += deltaSec;
+      }
+      tripStats.lastRunTickMs = nowMs;
     } else {
-      replayRunning = true;
-      if ($("lcModeBadge")) $("lcModeBadge").textContent = "SIM";
-      $("sharedReplayBar").hidden = false;
-      $("replayPlayBtn").textContent = "Dừng";
-      $("replaySlider").max = String(sampleFrames.length - 1);
-      $("pBtnDemo").textContent = "Thoát";
-      $("lBtnDemo").textContent = "Thoát";
-      $("pBtnDemo").classList.add("is-active");
-      $("lBtnDemo").classList.add("is-active");
-      setStatus("ok", "Phát mẫu");
-      stepReplay();
-      triggerReplayAutoHide();
+      tripStats.lastRunTickMs = 0;
     }
-  }
 
-  $("pBtnDemo").addEventListener("click", toggleDemo);
-  $("lBtnDemo").addEventListener("click", toggleDemo);
-  $("cBtnEmptyDemo").addEventListener("click", toggleDemo);
-
-  // Landscape Toolbar & Replay Bar Overlay Toggle & Auto-hide
-  let toolbarAutoHideTimer = null;
-  function openOverlayToolbar() {
-    const bar = $("lhudOverlayToolbar");
-    if (!bar) return;
-    bar.hidden = false;
-    if (toolbarAutoHideTimer) clearTimeout(toolbarAutoHideTimer);
-    toolbarAutoHideTimer = setTimeout(() => {
-      bar.hidden = true;
-    }, 5000);
-  }
-  function closeOverlayToolbar() {
-    const bar = $("lhudOverlayToolbar");
-    if (bar) bar.hidden = true;
-    if (toolbarAutoHideTimer) {
-      clearTimeout(toolbarAutoHideTimer);
-      toolbarAutoHideTimer = null;
+    if (lastSpeedIntegrateMs > 0 && d.vssKmh > 0) {
+      const dtHrs = Math.min(2.0, (nowMs - lastSpeedIntegrateMs) / 1000) / 3600;
+      const dKm = d.vssKmh * dtHrs;
+      tripMeters += dKm * 1000;
+      odoKm += dKm;
+      oilKm += dKm;
+      saveVal(LS_KEYS.odoKm, odoKm.toFixed(3));
+      saveVal(LS_KEYS.oilKm, oilKm.toFixed(3));
     }
-  }
-  if ($("lcModeBadge")) {
-    $("lcModeBadge").addEventListener("click", () => {
-      // If replay is running and hidden, tapping SIM restores the replay bar
-      if (replayRunning && $("sharedReplayBar") && $("sharedReplayBar").hidden) {
-        $("sharedReplayBar").hidden = false;
-        triggerReplayAutoHide();
-        return;
-      }
-      const bar = $("lhudOverlayToolbar");
-      if (bar) {
-        if (bar.hidden) openOverlayToolbar();
-        else closeOverlayToolbar();
-      }
-    });
-  }
-  if ($("btnCloseToolbar")) {
-    $("btnCloseToolbar").addEventListener("click", closeOverlayToolbar);
-  }
+    lastSpeedIntegrateMs = nowMs;
 
-  // Keep replay bar visible while interacting with it
-  ["touchstart", "pointerdown", "input"].forEach((evt) => {
-    $("sharedReplayBar").addEventListener(evt, triggerReplayAutoHide, { passive: true });
-  });
-
-  $("replayPlayBtn").addEventListener("click", () => {
-    if (replayRunning) {
-      replayRunning = false;
-      if (replayTimer) { clearTimeout(replayTimer); replayTimer = null; }
-      $("replayPlayBtn").textContent = "Chạy";
-      setStatus("warn", "Tạm dừng");
-    } else {
-      replayRunning = true;
-      $("replayPlayBtn").textContent = "Dừng";
-      setStatus("ok", "Phát mẫu");
-      stepReplay();
+    if (d.rpm > peakRpm) peakRpm = d.rpm;
+    if (d.tpsPct > peakTps) peakTps = d.tpsPct;
+    if (d.rpm > tripStats.peakRpm) tripStats.peakRpm = d.rpm;
+    if (d.tpsPct > tripStats.peakTps) tripStats.peakTps = d.tpsPct;
+    if (d.vssKmh > tripStats.peakVss) tripStats.peakVss = d.vssKmh;
+    if (d.vbat > 4.0) {
+      if (tripStats.minVbat === null || d.vbat < tripStats.minVbat) tripStats.minVbat = d.vbat;
+      if (tripStats.maxVbat === null || d.vbat > tripStats.maxVbat) tripStats.maxVbat = d.vbat;
     }
-  });
-  $("replaySlider").addEventListener("input", () => renderReplayAt(parseInt($("replaySlider").value, 10)));
-  document.querySelectorAll("#sharedReplayBar .speed-btn").forEach((b) => {
-    b.addEventListener("click", () => {
-      document.querySelectorAll("#sharedReplayBar .speed-btn").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      replaySpeed = parseFloat(b.dataset.speed) || 1;
-    });
-  });
 
-  // Scope / Dyno / Lab Controls
-  document.querySelectorAll(".chip").forEach((c) => {
-    c.addEventListener("click", () => {
-      const k = c.dataset.ch;
-      scopeEnabled[k] = !scopeEnabled[k];
-      c.classList.toggle("active", scopeEnabled[k]);
-      drawScope();
-    });
-  });
-  $("btnScopeFreeze").addEventListener("click", () => {
-    scopeFrozen = !scopeFrozen;
-    $("btnScopeFreeze").textContent = scopeFrozen ? "Tiếp tục" : "Đóng băng";
-    $("btnScopeFreeze").classList.toggle("is-active", scopeFrozen);
-  });
-  $("nBtnResetBounds").addEventListener("click", () => {
-    for (const k in minmax) delete minmax[k];
-    trip.peakRpm = 0;
-    maxEctSession = latestFrame ? latestFrame.ectC : null;
-  });
-  $("btnResetTrip").addEventListener("click", () => {
-    trip = { runSec: 0, peakRpm: 0, maxTps: 0, warnCount: 0, minBat: null, maxBat: null };
-    saveTrip();
-  });
-  $("btnResetOil").addEventListener("click", () => {
-    oilHoursBase = 0;
-    saveTrip();
-    $("tOilText").textContent = "0.0 / 25.0 giờ";
-    $("tOilFill").style.width = "0%";
-  });
-  $("btnResetPull").addEventListener("click", () => {
-    pullState = "IDLE";
-    pullBest = null;
-    $("pullStateTxt").textContent = "CHỜ (< 3,800 RPM để nạp)";
-    $("pullCurTxt").textContent = "--.-- s";
-    $("pullBestTxt").textContent = "BEST --.-- s";
-  });
-  document.querySelectorAll("#mapMetricGroup .speed-btn").forEach((b) => {
-    b.addEventListener("click", () => {
-      document.querySelectorAll("#mapMetricGroup .speed-btn").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      mapMetric = b.dataset.metric;
-      for (const k in mapCells) delete mapCells[k];
-      scopeHistory.forEach(recordMapCell);
+    /* Drive 60fps smooth targets */
+    anim.targetRpm = d.rpm;
+    anim.targetVss = d.vssKmh;
+    anim.targetTps = d.tpsPct;
+    kickAnimLoop();
+
+    /* Peak Badges */
+    const peakTxt = "PEAK " + Math.round(peakRpm);
+    if ($("cPeakHold")) $("cPeakHold").textContent = peakTxt;
+    if ($("nPeakRpm")) $("nPeakRpm").textContent = peakTxt;
+    if ($("lcPeak")) $("lcPeak").textContent = peakTxt;
+    if ($("lnPeak")) $("lnPeak").textContent = peakTxt;
+    if ($("cTpsMaxChip")) $("cTpsMaxChip").textContent = "MAX " + Math.round(peakTps) + "%";
+    if ($("lcTpsMax")) $("lcTpsMax").textContent = "MAX " + Math.round(peakTps) + "%";
+
+    /* Gear Pull-Learner & Virtual Gear v2 */
+    if (gearLearner.isActive()) {
+      gearLearner.feed(d.rpm, d.vssKmh, d.tpsPct);
+      renderGearLearnerUi();
+    }
+    const gGear = gearTracker.update(d.rpm, d.vssKmh, nowMs, d.tpsPct, d.injMs);
+    const gModel = gearTracker.getModel();
+    const gState = gearTracker.getState();
+    let gSubLabel = "Chờ ECU";
+    if (gGear === "N") gSubLabel = "Số Mo (0 km/h)";
+    else if (gGear === "--") gSubLabel = "Chờ chuyển động";
+    else {
+      const idx = parseInt(gGear, 10) - 1;
+      const src = gModel.sources[idx] || "default";
+      gSubLabel = gState.frozenByClutch ? "Âm côn · trôi" : (src === "learned" ? "Đã học" : src === "derived" ? "Từ số 1" : "Mặc định");
+    }
+
+    const gearChanged = gGear !== lastGearChar;
+    lastGearChar = gGear;
+
+    const gearClsSuffix = " gear-" + (gGear >= "1" && gGear <= "6" ? gGear : "N") + (gearChanged ? " gear-pop" : "");
+    if ($("cGearVal")) {
+      $("cGearVal").textContent = gGear;
+      $("cGearVal").className = "gear-cap-val" + gearClsSuffix;
+    }
+    if ($("lcGearVal")) {
+      $("lcGearVal").textContent = gGear;
+      $("lcGearVal").className = "tft-gear-digit" + gearClsSuffix;
+    }
+    if ($("cGearSub")) $("cGearSub").textContent = gSubLabel;
+    if ($("lcGearSub")) $("lcGearSub").textContent = gSubLabel;
+
+    /* Health & Warnings */
+    const warnings = [];
+    let bannerSeverity = "ok";
+    if (faultCount > 0) { warnings.push(`CÓ ${faultCount} MÃ LỖI FI`); bannerSeverity = "danger"; }
+    if (d.ectC >= 108) { warnings.push(`QUÁ NHIỆT ${d.ectC}°C`); bannerSeverity = "danger"; }
+    else if (d.ectC >= 98) { warnings.push(`NƯỚC NÓNG ${d.ectC}°C`); if (bannerSeverity === "ok") bannerSeverity = "warn"; }
+    if (d.vbat > 0.5 && d.vbat < 11.4) { warnings.push(`BÌNH YẾU ${d.vbat.toFixed(1)}V`); if (bannerSeverity === "ok") bannerSeverity = "warn"; }
+    else if (d.vbat > 15.2) { warnings.push(`QUÁ ÁP ${d.vbat.toFixed(1)}V`); bannerSeverity = "danger"; }
+
+    if (bannerSeverity !== "ok" && !tripStats.warnBannerActive) {
+      tripStats.warnCount += 1;
+      tripStats.warnBannerActive = true;
+    } else if (bannerSeverity === "ok") {
+      tripStats.warnBannerActive = false;
+    }
+
+    if ($("casualBanner")) $("casualBanner").className = "status-banner " + bannerSeverity;
+    if ($("cHealthDot")) $("cHealthDot").className = "status-dot";
+    const healthTxt = warnings.length ? warnings.join(" · ") : (d.rpm > 400 ? "ĐỘNG CƠ HOẠT ĐỘNG ỔN ĐỊNH" : "KHÓA ON · SẴN SÀNG ĐỀ MÁY");
+    if ($("cHealthText")) $("cHealthText").textContent = healthTxt;
+    if ($("lBannerTxt")) $("lBannerTxt").textContent = healthTxt;
+
+    /* Secondary Casual Gauges (Zero duplicate IDs!) */
+    const ectCls = d.ectC >= 106 ? "danger" : d.ectC >= 96 ? "warn" : d.ectC >= 55 ? "ok" : "";
+    const ectSub = d.ectC < 50 ? "Máy nguội" : d.ectC >= 106 ? "Nóng quá!" : "Bình thường";
+    const ectNorm = Math.max(0, Math.min(1, (d.ectC - 20) / 100));
+    setScaleX("cEctFill", ectNorm);
+    setScaleX("lcEctFill", ectNorm);
+    if ($("cEctNum")) { $("cEctNum").textContent = String(d.ectC); $("cEctNum").className = "metric-val " + ectCls; }
+    if ($("cEctSub")) $("cEctSub").textContent = ectSub;
+    if ($("lcEctNum")) { $("lcEctNum").textContent = String(d.ectC); $("lcEctNum").className = "lhud-mini-val " + ectCls; }
+    if ($("lcEctSub")) $("lcEctSub").textContent = ectSub;
+
+    const batCls = d.vbat < 11.5 || d.vbat > 15.1 ? "danger" : d.vbat < 12.2 ? "warn" : "ok";
+    const batSub = d.vbat >= 13.4 ? "Đang sạc" : d.vbat < 11.8 ? "Sạc yếu" : "Ổn định";
+    const batNorm = Math.max(0, Math.min(1, (d.vbat - 10) / 5.5));
+    setScaleX("cVbatFill", batNorm);
+    setScaleX("lcBatFill", batNorm);
+    if ($("cVbatNum")) { $("cVbatNum").textContent = d.vbat.toFixed(1); $("cVbatNum").className = "metric-val " + batCls; }
+    if ($("cVbatSub")) $("cVbatSub").textContent = batSub;
+    if ($("lcBatNum")) { $("lcBatNum").textContent = d.vbat.toFixed(1); $("lcBatNum").className = "lhud-mini-val " + batCls; }
+    if ($("lcBatSub")) $("lcBatSub").textContent = batSub;
+
+    if ($("cIatNum")) $("cIatNum").textContent = String(d.iatC);
+    if ($("lcIatNum")) $("lcIatNum").textContent = String(d.iatC);
+
+    const mapWord = d.mapKpa > 82 ? "GA LỚN" : d.mapKpa > 48 ? "TẢI VỪA" : "KHÔNG TẢI";
+    if ($("cMapWord")) $("cMapWord").textContent = mapWord;
+    if ($("cMapKpaSub")) $("cMapKpaSub").textContent = d.mapKpa + " kPa";
+    if ($("cMapSub")) $("cMapSub").textContent = d.mapVolt.toFixed(2) + " V";
+    if ($("lcMapWord")) $("lcMapWord").textContent = mapWord;
+    if ($("lcMapSub")) $("lcMapSub").textContent = d.mapKpa + " kPa";
+
+    /* Nerdy Telemetry Deck */
+    if ($("nDfcoPill")) $("nDfcoPill").className = "pill-tag" + (d.dfco ? " active" : "");
+    if ($("nDfcoPill")) $("nDfcoPill").textContent = d.dfco ? "DFCO CUT" : "INJ ACTIVE";
+    if ($("nDutyTop")) $("nDutyTop").textContent = d.injDuty.toFixed(1) + "%";
+    if ($("lnDuty")) $("lnDuty").textContent = d.injDuty.toFixed(1) + "%";
+
+    if ($("nTpsVolt")) $("nTpsVolt").textContent = d.tpsVolt.toFixed(2) + "V";
+    if ($("lnTpsVolt")) $("lnTpsVolt").textContent = d.tpsVolt.toFixed(2) + "V";
+    if ($("nMapNum")) $("nMapNum").textContent = String(d.mapKpa);
+    if ($("nMapSub")) $("nMapSub").textContent = d.mapVolt.toFixed(2) + "V";
+    if ($("lnMapNum")) $("lnMapNum").textContent = d.mapKpa + " kPa";
+
+    if ($("nInjNum")) {
+      $("nInjNum").textContent = d.injMs.toFixed(2);
+      $("nInjNum").className = "sensor-val" + (d.injDuty >= 85 ? " warn" : "");
+    }
+    if ($("nInjSub")) $("nInjSub").textContent = "Duty " + d.injDuty.toFixed(1) + "%";
+    if ($("lnInjNum")) $("lnInjNum").textContent = d.injMs.toFixed(2) + "ms";
+
+    if ($("nIgnNum")) $("nIgnNum").textContent = String(d.ignDeg);
+    if ($("lnIgnNum")) $("lnIgnNum").textContent = d.ignDeg + "°";
+
+    if ($("nO2Num")) $("nO2Num").textContent = d.o2Volt.toFixed(2);
+    const afrTxt = typeof d.afrEst === "number" ? d.afrEst.toFixed(1) : String(d.afrEst || "--");
+    if ($("nO2Sub")) $("nO2Sub").textContent = "AFR " + afrTxt;
+    if ($("lnAfrNum")) $("lnAfrNum").textContent = d.o2Volt.toFixed(2) + "V/" + afrTxt;
+
+    if ($("nIacvNum")) $("nIacvNum").textContent = String(d.iacvStp);
+    if ($("lnIacvNum")) $("lnIacvNum").textContent = String(d.iacvStp);
+
+    if ($("nEctNum")) { $("nEctNum").textContent = String(d.ectC); $("nEctNum").className = "sensor-val " + ectCls; }
+    if ($("nEctSub")) $("nEctSub").textContent = d.ectVolt.toFixed(2) + "V";
+    if ($("lnEctNum")) $("lnEctNum").textContent = d.ectC + "°C";
+
+    if ($("nIatNum")) $("nIatNum").textContent = String(d.iatC);
+    if ($("nIatSub")) $("nIatSub").textContent = d.iatVolt.toFixed(2) + "V";
+    if ($("lnIatNum")) $("lnIatNum").textContent = d.iatC + "°C";
+
+    if ($("nVbatNum")) { $("nVbatNum").textContent = d.vbat.toFixed(1); $("nVbatNum").className = "sensor-val " + batCls; }
+    if ($("lnBatNum")) $("lnBatNum").textContent = d.vbat.toFixed(1) + "V";
+
+    updateBound("tps", d.tpsPct, "%", 0, "mmDotTps", "mmLblTps");
+    updateBound("map", d.mapKpa, "", 0, "mmDotMap", "mmLblMap");
+    updateBound("inj", d.injMs, "", 1, "mmDotInj", "mmLblInj");
+    updateBound("ign", d.ignDeg, "", 0, "mmDotIgn", "mmLblIgn");
+    updateBound("o2", d.o2Volt, "", 2, "mmDotO2", "mmLblO2");
+    updateBound("iacv", d.iacvStp, "", 0, "mmDotIacv", "mmLblIacv");
+    updateBound("ect", d.ectC, "", 0, "mmDotEct", "mmLblEct");
+    updateBound("iat", d.iatC, "", 0, "mmDotIat", "mmLblIat");
+    updateBound("vbat", d.vbat, "", 1, "mmDotVbat", "mmLblVbat");
+    updateBound("vss", d.vssKmh, "", 0, "mmDotVss", "mmLblVss");
+
+    if ($("lnEctMax") && bounds.ect[1] !== null) $("lnEctMax").textContent = Math.round(bounds.ect[1]) + "°";
+    if ($("lnBatMin") && bounds.vbat[0] !== null) $("lnBatMin").textContent = bounds.vbat[0].toFixed(1) + "V";
+
+    history.push(d);
+    if (history.length > HISTORY_MAX) history.shift();
+    recordMapCell(d);
+    updatePullTimer(d.vssKmh);
+    renderTripStats();
+
+    if (currentPage === "casual-overview") drawOverviewChart();
+    if (currentPage === "nerdy-tuning") {
+      if (!scopeFrozen) drawScope();
       renderMapTable();
-    });
-  });
-  $("btnClearMap").addEventListener("click", () => {
-    for (const k in mapCells) delete mapCells[k];
-    renderMapTable();
-  });
+    }
 
-  $("lRedlineSlider").value = String(redlineRpm);
-  $("lRedlineVal").textContent = redlineRpm.toLocaleString("en-US") + " RPM";
-  $("lRedlineSlider").addEventListener("input", () => {
-    redlineRpm = parseInt($("lRedlineSlider").value, 10);
-    localStorage.setItem("kline_redline", String(redlineRpm));
-    $("lRedlineVal").textContent = redlineRpm.toLocaleString("en-US") + " RPM";
-  });
-
-  function sendBtCmd(cmd) {
-    appendHexLog(">> TX: " + cmd.trim());
-    if (window.AndroidBT) {
-      window.AndroidBT.send(cmd);
-    } else {
-      $("lDtcOut").textContent = "Chỉ gửi được lệnh khi kết nối Bluetooth với STM32.";
+    if (isRecording) {
+      csvRows.push([
+        new Date().toISOString(),
+        d.rpm, d.tpsVolt.toFixed(2), Math.round(d.tpsPct), d.ectC, d.iatC,
+        d.mapKpa, d.vbat.toFixed(2), d.vssKmh, gGear,
+        d.injMs.toFixed(2), d.injDuty.toFixed(1), d.ignDeg, d.iacvStp,
+        d.o2Volt.toFixed(2), (typeof d.afrEst === "number" ? d.afrEst.toFixed(1) : String(d.afrEst || "--")), d.dfco ? 1 : 0
+      ].join(","));
     }
   }
 
-  function triggerReadDtc() { sendBtCmd("READ_ECMID\r\n"); setTimeout(() => sendBtCmd("READ_DTC\r\n"), 120); }
-  $("cBtnReadDtc").addEventListener("click", triggerReadDtc);
-  $("mBtnReadDtc").addEventListener("click", triggerReadDtc);
-  $("cBtnClearDtc").addEventListener("click", () => sendBtCmd("CLEAR_DTC\r\n"));
-  $("mBtnClearDtc").addEventListener("click", () => sendBtCmd("CLEAR_DTC\r\n"));
-  $("lBtnReadDtc").addEventListener("click", () => sendBtCmd("READ_DTC\r\n"));
-  $("lBtnReadEcmId").addEventListener("click", () => sendBtCmd("READ_ECMID\r\n"));
-  $("lBtnClearDtc").addEventListener("click", () => sendBtCmd("CLEAR_DTC\r\n"));
-  $("lBtnWakeup").addEventListener("click", () => sendBtCmd("WAKEUP\r\n"));
-  $("lBtnScs").addEventListener("click", () => {
-    scsActive = !scsActive;
-    $("lBtnScs").textContent = scsActive ? "SCS: Bật" : "SCS: Tắt";
-    $("lBtnScs").classList.toggle("is-active", scsActive);
-    sendBtCmd(scsActive ? "SCS_ON\r\n" : "SCS_OFF\r\n");
-  });
-  $("lBtnProbeTable").addEventListener("click", () => {
-    const val = $("lTableInput").value.trim().toUpperCase().replace("0X", "").padStart(2, "0");
-    if (/^[0-9A-F]{2}$/.test(val)) sendBtCmd("REQ_TABLE:" + val + "\r\n");
-  });
-  $("lBtnClearHex").addEventListener("click", () => { $("lHexConsole").textContent = ""; });
-
-  function appendHexLog(txt) {
+  /* ── HARDWARE PACKET HANDLER ── */
+  function appendHexConsole(line) {
+    if (hexPaused) return;
+    hexLines.push(line);
+    if (hexLines.length > 75) hexLines.shift();
     const el = $("lHexConsole");
-    const lines = el.textContent ? el.textContent.split("\n") : [];
-    lines.push(txt);
-    if (lines.length > 80) lines.splice(0, lines.length - 80);
-    el.textContent = lines.join("\n");
-    el.scrollTop = el.scrollHeight;
-  }
-
-  // Bluetooth Modal & Bridge
-  function renderDev(dev, container) {
-    const row = document.createElement("div");
-    row.className = "dev-item";
-    row.innerHTML = '<div><div class="dev-name">' + (dev.name || "Unknown") + '</div><div class="dev-mac">' + dev.mac + (dev.rssi ? " · " + dev.rssi + " dBm" : "") + "</div></div>";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "btn btn--mini";
-    btn.textContent = dev.type === "ble" ? "BLE" : "SPP";
-    btn.addEventListener("click", () => {
-      if (replayRunning) toggleDemo();
-      $("btModal").hidden = true;
-      if (window.AndroidBT) {
-        if (dev.type === "ble") window.AndroidBT.connectBle(dev.mac);
-        else window.AndroidBT.connectSpp(dev.mac);
-      }
-    });
-    row.appendChild(btn);
-    container.appendChild(row);
-  }
-
-  function refreshUsbDiag() {
-    if (!window.AndroidBT || !window.AndroidBT.getUsbDebugInfo) return;
-    try {
-      const raw = window.AndroidBT.getUsbDebugInfo();
-      const d = JSON.parse(raw);
-      const box = $("usbDiagBox");
-      if (!box) return;
-      if (!d.hasDevice) {
-        box.innerHTML = 'Phần cứng: <span style="color:#F59E0B">Chưa thấy cáp OTG</span><br><small style="color:#94A3B8">Hãy cắm cáp OTG & module CH340 vào máy (Nếu Meizu chưa nhận: vào Cài đặt -> bật OTG)</small>';
-      } else {
-        const permColor = d.hasPermission ? "#10B981" : "#EF4444";
-        const permTxt = d.hasPermission ? "ĐÃ CẤP" : "CHƯA CẤP (Bấm 'Kết nối USB')";
-        const connColor = d.isConnected ? "#10B981" : "#F59E0B";
-        const connTxt = d.isConnected ? "ĐÃ MỞ CỔNG" : "CHƯA MỞ";
-        let diagHint = "";
-        const preview = d.lastRxPreview || "";
-        if (preview.includes("72 05 71 11") && !preview.includes("02 19")) {
-          diagHint = `<br><span style="color:#F59E0B">⚠️ Đã nhận echo từ STM32 nhưng ECU chưa trả lời. Hãy BẬT KHÓA ĐIỆN XE và kiểm tra dây Mass (GND cọc âm) & trở kéo 510Ω.</span>`;
-        } else if (preview.includes("02 19 71 11")) {
-          diagHint = `<br><span style="color:#10B981">✅ Đang nhận gói Table 11 từ ECU!</span>`;
-        }
-        box.innerHTML = `Chip: <b>${d.chipName}</b> (${d.vid}:${d.pid})<br>`
-          + `Quyền USB: <b style="color:${permColor}">${permTxt}</b> · Cổng: <b style="color:${connColor}">${connTxt}</b><br>`
-          + `Đã nhận: <b style="color:#00E5FF">${d.rxBytes} Bytes (${d.rxPackets} gói)</b><br>`
-          + `Dữ liệu gần nhất: <span style="color:#E2E8F0; word-break:break-all;">${d.lastRxPreview || "--"}</span>`
-          + diagHint
-          + (d.lastError ? `<br><span style="color:#EF4444">Lỗi: ${d.lastError}</span>` : "");
-      }
-    } catch (_e) {}
-  }
-
-  function scanBt() {
-    refreshUsbDiag();
-    if (!window.AndroidBT) {
-      $("btModalStatus").textContent = "Đang chạy trên trình duyệt PC — Dùng nút Demo để test.";
-      return;
-    }
-    if (!window.AndroidBT.hasPermissions()) {
-      window.AndroidBT.requestBtPermissions();
-      return;
-    }
-    $("pairedList").innerHTML = '<div class="muted-note">Đang tải thiết bị đã ghép nối...</div>';
-    $("bleList").innerHTML = '<div class="muted-note">Đang quét BLE (6s)...</div>';
-    window.AndroidBT.getPairedAndScan();
-  }
-
-  let usbPollTimer = null;
-  $("pBtnBt").addEventListener("click", () => { $("btModal").hidden = false; scanBt(); startUsbPoll(); });
-  $("lBtnBt").addEventListener("click", () => { $("btModal").hidden = false; scanBt(); startUsbPoll(); });
-  if ($("lBtnToolbarConnect")) {
-    $("lBtnToolbarConnect").addEventListener("click", () => {
-      closeOverlayToolbar();
-      $("btModal").hidden = false;
-      scanBt();
-      startUsbPoll();
-    });
-  }
-  $("btnCloseModal").addEventListener("click", () => { $("btModal").hidden = true; stopUsbPoll(); });
-
-  function startUsbPoll() {
-    stopUsbPoll();
-    refreshUsbDiag();
-    usbPollTimer = setInterval(refreshUsbDiag, 1000);
-  }
-
-  function stopUsbPoll() {
-    if (usbPollTimer) {
-      clearInterval(usbPollTimer);
-      usbPollTimer = null;
+    if (el) {
+      el.textContent = hexLines.join("\n");
+      el.scrollTop = el.scrollHeight;
     }
   }
-  $("btnScanBt").addEventListener("click", scanBt);
-  $("btnDisconnectBt").addEventListener("click", () => {
-    if (window.AndroidBT) window.AndroidBT.disconnect();
-    btConnected = false;
-    usbConnected = false;
-    setBtBtnState("");
-    setStatus("", "Chưa kết nối");
-    if ($("lcModeBadge")) $("lcModeBadge").textContent = "IDLE";
-    renderIdleState();
-  });
 
-  if ($("btnConnectUsb")) {
-    $("btnConnectUsb").addEventListener("click", () => {
-      if (replayRunning) toggleDemo();
-      $("btModal").hidden = true;
-      if (window.AndroidBT && window.AndroidBT.connectUsb) {
-        window.AndroidBT.connectUsb();
-      } else {
-        $("btModalStatus").textContent = "Chỉ khả dụng trên điện thoại Android khi cắm cáp OTG";
-      }
-    });
-  }
-
-  if ($("btnWakeupUsb")) {
-    $("btnWakeupUsb").addEventListener("click", () => {
-      if (window.AndroidBT && window.AndroidBT.sendWakeup) {
-        window.AndroidBT.sendWakeup();
-        setStatus("warn", "Đang gửi lệnh WAKEUP...");
-        if ($("btModalStatus")) $("btModalStatus").textContent = "Đã gửi lệnh WAKEUP đánh thức ECU!";
-      }
-    });
-  }
-
-  if ($("btnDisconnectUsb")) {
-    $("btnDisconnectUsb").addEventListener("click", () => {
-      if (window.AndroidBT && window.AndroidBT.disconnectUsb) {
-        window.AndroidBT.disconnectUsb();
-      }
-      btConnected = false;
-      usbConnected = false;
-      setBtBtnState("");
-      setStatus("", "Đã ngắt USB");
-      if ($("lcModeBadge")) $("lcModeBadge").textContent = "IDLE";
-      renderIdleState();
-    });
-  }
-
-  window.__onBtPermissions = (ok) => { if (ok) scanBt(); };
-  window.__onPairedDevices = (jsonStr) => {
-    try {
-      const list = JSON.parse(jsonStr);
-      $("pairedList").innerHTML = "";
-      if (!list.length) $("pairedList").innerHTML = '<div class="muted-note">Chưa có HC-05 / HC-06 nào ghép nối.</div>';
-      else list.forEach((d) => renderDev(d, $("pairedList")));
-    } catch (_e) {}
-  };
-  let bleCnt = 0;
-  window.__onBleDeviceFound = (jsonStr) => {
-    try {
-      const dev = JSON.parse(jsonStr);
-      if (bleCnt === 0) $("bleList").innerHTML = "";
-      bleCnt += 1;
-      renderDev(dev, $("bleList"));
-    } catch (_e) {}
-  };
-  window.__onBleScanDone = () => {
-    if (bleCnt === 0) $("bleList").innerHTML = '<div class="muted-note">Không thấy thiết bị BLE xung quanh.</div>';
-    bleCnt = 0;
-  };
-  window.__onBtStatus = (st, msg) => {
-    $("btModalStatus").textContent = msg || st;
-    const isUsb = Boolean(msg && (msg.includes("USB") || msg.includes("OTG")));
-    if (st === "connected") {
-      btConnected = true;
-      usbConnected = isUsb;
-      setBtBtnState("ok");
-      setStatus("ok", isUsb ? "USB Online" : "BT Online");
-      if ($("lBannerTxt")) $("lBannerTxt").textContent = msg || (isUsb ? "USB Online · Chờ tín hiệu ECU" : "BT Online");
-      if ($("lcModeBadge")) $("lcModeBadge").textContent = isUsb ? "USB" : "LIVE";
-      $("chkBtDot").className = "conn-dot ok";
-      $("chkBtTxt").textContent = isUsb ? "Đã kết nối USB OTG" : "Đã kết nối Bluetooth";
-      if (isUsb && $("lConnSvgWrap")) {
-        $("lConnSvgWrap").innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#00FF66" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><path d="M12 2v8M12 14v8M5 10l7-5 7 5"/></svg>';
-      }
-    } else if (st === "connecting") {
-      setBtBtnState("warn");
-      setStatus("warn", "Đồng bộ");
-      if ($("lBannerTxt")) $("lBannerTxt").textContent = msg || "Đang kết nối...";
-      if ($("lcModeBadge")) $("lcModeBadge").textContent = "SYNC";
-    } else if (st === "error") {
-      btConnected = false;
-      usbConnected = false;
-      setBtBtnState("err");
-      setStatus("err", "Lỗi");
-      if ($("lBannerTxt")) $("lBannerTxt").textContent = msg || "Lỗi kết nối";
-      if ($("lcModeBadge")) {
-        $("lcModeBadge").textContent = "ERR";
-        $("lcModeBadge").classList.add("is-err");
-      }
-    } else {
-      btConnected = false;
-      usbConnected = false;
-      setBtBtnState("");
-      setStatus("", "Chưa kết nối");
-      if ($("lBannerTxt")) $("lBannerTxt").textContent = msg || "Bật khóa xe hoặc chạy Demo";
-      if ($("lcModeBadge")) {
-        $("lcModeBadge").textContent = replayRunning ? "SIM" : "IDLE";
-        $("lcModeBadge").classList.remove("is-err");
-      }
-      $("chkBtDot").className = "conn-dot";
-      $("chkBtTxt").textContent = "Chưa kết nối";
-      if ($("lConnSvgWrap")) {
-        $("lConnSvgWrap").innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 7 10 10-5 5V2l5 5L7 17"/></svg>';
-      }
-      if (!replayRunning) renderIdleState();
-    }
-  };
-
-  window.__onBtFrame = (line) => {
-    appendHexLog(line);
-    if (!line || typeof line !== "string") return;
-
-    // 0. STM32 Reset / Brownout Diagnostic detection
-    if (line.includes("MCU_BOOT:")) {
-      const rstReason = line.replace("MCU_BOOT:", "").trim();
-      setStatus("warn", "STM32 Boot: " + rstReason);
-      $("chkEcuDot").className = "conn-dot warn";
-      $("chkEcuTxt").textContent = "Cảnh báo Reset: " + rstReason;
-      if ($("lBannerTxt")) $("lBannerTxt").textContent = "Cảnh báo Reset MCU: " + rstReason;
-      if ($("cHealthText")) $("cHealthText").textContent = "Cảnh báo Reset MCU: " + rstReason;
-      return;
+  window.__onBtLine = function (rawLine) {
+    const clean = String(rawLine || "").trim();
+    if (!clean) return;
+    if (clean.startsWith("[") || clean.includes("ERR") || clean.includes("TIMEOUT")) {
+      appendHexConsole(clean);
+      if (clean.includes("ERR") || clean.includes("TIMEOUT")) logAppDebug("ECU", clean);
     }
 
-    // 1. STM32 FastInit / Handshake status messages
-    if (line.includes("Dang danh thuc") || line.includes("Gui ma") || line.includes("Hoan tat") || line.includes("Tu dong ket noi")) {
-      const isDone = line.includes("Hoan tat");
-      const shortMsg = isDone ? "Đã khởi tạo (Chờ ECU...)" : line.split("...")[0].slice(0, 24);
-      setStatus("warn", shortMsg);
-      $("chkEcuDot").className = "conn-dot warn";
-      $("chkEcuTxt").textContent = line;
-      if ($("lBannerTxt")) $("lBannerTxt").textContent = line;
-      if ($("cHealthText")) $("cHealthText").textContent = line;
-      return;
-    }
-
-    // 2. Parse any Keihin ECU response
-    const pkt = parseKlinePacket(line);
-    if (!pkt) {
-      // Detect STM32 TX query echo (72 05 71 11) when ECU has not replied with 02 19
-      if (line.includes("72 05 71 11") || line.includes("72 05")) {
-        setStatus("warn", "Chờ phản hồi ECU");
-        $("chkEcuDot").className = "conn-dot warn";
-        const waitNotice = "STM32 phát lệnh OK · Đang chờ ECU (Kiểm tra chìa khóa/GND Mass)";
-        $("chkEcuTxt").textContent = waitNotice;
-        if ($("lBannerTxt")) $("lBannerTxt").textContent = waitNotice;
-        if ($("cHealthText")) $("cHealthText").textContent = waitNotice;
-      }
-      return;
+    const pkt = Core.parseKlinePacket(clean);
+    if (!pkt) return;
+    if (pkt.kind !== "table11" || currentPage === "nerdy-lab") {
+      appendHexConsole(pkt.rawHex || clean);
     }
 
     if (pkt.kind === "table11") {
-      setStatus("ok", "ECU Online");
       applyFrame(pkt);
-      const onlineMsg = `ECU Online · RPM ${pkt.rpm} · ${pkt.vbat}V · ECT ${pkt.ectC}°C`;
-      if ($("lBannerTxt")) $("lBannerTxt").textContent = onlineMsg;
-      if ($("cHealthText")) $("cHealthText").textContent = onlineMsg;
     } else if (pkt.kind === "ecmid") {
-      $("cEcmId").textContent = pkt.ecmId;
-      $("lEcmId").textContent = pkt.ecmId;
-      $("fiModalEcm").textContent = "ECM ID: " + pkt.ecmId;
+      activeEcmId = pkt.ecmId;
+      if ($("cEcmId")) $("cEcmId").textContent = pkt.ecmId;
+      if ($("lEcmId")) $("lEcmId").textContent = pkt.ecmId;
+      if ($("fiModalEcm")) $("fiModalEcm").textContent = pkt.ecmId;
     } else if (pkt.kind === "dtc") {
-      faultCount = pkt.faults.length;
-      updateFiLamp();
-      const htmlList = !pkt.faults.length
-        ? '<div class="dtc-card ok"><strong>Lỗi ' + pkt.dtcType + ': Không phát hiện mã lỗi</strong><div class="muted-note">Hệ thống PGM-FI hoạt động bình thường.</div></div>'
-        : pkt.faults.map((f) => '<div class="dtc-card"><strong>Mã #' + f.code + " (" + f.raw + ") · " + pkt.dtcType + '</strong><div class="muted-note">' + f.desc + "</div></div>").join("");
-      $("cDtcList").innerHTML = htmlList;
-      $("mDtcList").innerHTML = htmlList;
-      $("lDtcOut").textContent = !pkt.faults.length
-        ? "[" + pkt.dtcType + "] Sạch lỗi (0 DTC)."
-        : pkt.faults.map((f) => "[" + pkt.dtcType + "] #" + f.code + ": " + f.desc).join("\n");
+      if (pkt.dtcType === "Hiện tại" || pkt.dtcType === "0x72") faultCount = pkt.faults.length;
+      updateConnIndicators(connState, null);
+      const html = pkt.faults.length === 0
+        ? `<div class="dtc-card ok"><strong>Lỗi ${pkt.dtcType}: Không phát hiện mã lỗi</strong><div>Động cơ &amp; cảm biến hoạt động bình thường.</div></div>`
+        : pkt.faults.map((f) => `<div class="dtc-card"><strong>Mã #${f.code} (${f.raw}) · ${pkt.dtcType}</strong><div>${f.desc}</div></div>`).join("");
+      if ($("cDtcList")) $("cDtcList").innerHTML = html;
+      if ($("mDtcList")) $("mDtcList").innerHTML = html;
+      if ($("lDtcOut")) $("lDtcOut").innerHTML = html;
     } else if (pkt.kind === "clear_dtc_ack") {
       faultCount = 0;
-      updateFiLamp();
+      updateConnIndicators(connState, null);
       const okHtml = '<div class="dtc-card ok"><strong>Đã xóa bộ nhớ lỗi ECU thành công</strong></div>';
-      $("cDtcList").innerHTML = okHtml;
-      $("mDtcList").innerHTML = okHtml;
-      $("lDtcOut").textContent = "ECU đã xác nhận xóa sạch bộ nhớ lỗi.";
+      if ($("cDtcList")) $("cDtcList").innerHTML = okHtml;
+      if ($("mDtcList")) $("mDtcList").innerHTML = okHtml;
+      if ($("lDtcOut")) $("lDtcOut").innerHTML = okHtml;
     } else if (pkt.kind === "custom") {
-      $("lDtcOut").textContent = "Table " + pkt.table + ": " + pkt.rawHex;
+      if ($("lDtcOut")) $("lDtcOut").textContent = `Table ${pkt.table}: ${pkt.rawHex}`;
+    }
+  };
+  window.__onBtFrame = window.__onBtLine;
+
+  window.__onBtStatus = function (state, message) {
+    updateConnIndicators(state, message);
+    logAppDebug("LINK", `${state}: ${message}`);
+    refreshUsbDiag();
+  };
+
+  window.__onBtPaired = function (jsonStr) {
+    const listEl = $("pairedList");
+    if (!listEl) return;
+    try {
+      const list = JSON.parse(jsonStr || "[]");
+      if (!list.length) {
+        listEl.innerHTML = '<div class="muted-note">Chưa có HC-05 / SPP nào ghép đôi.</div>';
+        return;
+      }
+      listEl.innerHTML = "";
+      list.forEach((dev) => {
+        const row = document.createElement("div");
+        row.className = "dev-item";
+        row.innerHTML = `<div><div class="dev-name">${dev.name || "Unknown"}</div><div class="dev-mac">${dev.mac}</div></div>`;
+        const btn = document.createElement("button");
+        btn.className = "btn btn-cyan btn-sm";
+        btn.textContent = "Kết nối";
+        btn.addEventListener("click", () => {
+          updateConnIndicators("connecting", "Đang nối " + (dev.name || dev.mac));
+          if (hasBridge()) window.AndroidBT.connectSpp(dev.mac);
+        });
+        row.appendChild(btn);
+        listEl.appendChild(row);
+      });
+    } catch (e) {
+      logAppDebug("BT_JSON", String(e));
+    }
+  };
+  window.__onPairedDevices = window.__onBtPaired;
+
+  window.__onBtBleFound = function (jsonStr) {
+    const listEl = $("bleList");
+    if (!listEl) return;
+    try {
+      const dev = JSON.parse(jsonStr);
+      if (listEl.querySelector(".muted-note")) listEl.innerHTML = "";
+      const row = document.createElement("div");
+      row.className = "dev-item";
+      row.innerHTML = `<div><div class="dev-name">${dev.name || "BLE Device"}</div><div class="dev-mac">${dev.mac} · ${dev.rssi || ""} dBm</div></div>`;
+      const btn = document.createElement("button");
+      btn.className = "btn btn-cyan btn-sm";
+      btn.textContent = "BLE";
+      btn.addEventListener("click", () => {
+        updateConnIndicators("connecting", "BLE " + (dev.name || dev.mac));
+        if (hasBridge()) window.AndroidBT.connectBle(dev.mac);
+      });
+      row.appendChild(btn);
+      listEl.appendChild(row);
+    } catch (e) {
+      logAppDebug("BLE_JSON", String(e));
+    }
+  };
+  window.__onBleDeviceFound = window.__onBtBleFound;
+  window.__onBleScanDone = function () {
+    const listEl = $("bleList");
+    if (listEl && !listEl.children.length) {
+      listEl.innerHTML = '<div class="muted-note">Không tìm thấy thiết bị BLE xung quanh.</div>';
     }
   };
 
-  window.addEventListener("resize", () => {
-    if (uiMode === "casual" && activeCasualTab === "overview" && hasLiveSignal) drawOverviewChart();
-    if (uiMode === "nerdy" && activeNerdyTab === "scope") drawScope();
-  });
+  /* ── HARDWARE & MODAL ACTIONS ── */
+  function sendCmd(cmd) {
+    if (hasBridge()) {
+      window.AndroidBT.send(cmd + "\r\n");
+    } else if (demoActive) {
+      logAppDebug("DEMO_CMD", "Simulated TX: " + cmd);
+      appendHexConsole("[DEMO TX] " + cmd);
+    }
+  }
 
-  syncModeAndTabs();
-  renderMapTable();
-  renderIdleState();
+  function refreshUsbDiag() {
+    const box = $("usbDiagBox");
+    if (!box) return;
+    if (!hasBridge()) {
+      box.textContent = "Trình duyệt Desktop / Dev Server · Mock AndroidBT sẵn sàng.";
+      return;
+    }
+    try {
+      const dbg = typeof window.AndroidBT.getUsbDebugInfo === "function" ? window.AndroidBT.getUsbDebugInfo() : "{}";
+      const info = JSON.parse(dbg || "{}");
+      const lines = [];
+      lines.push(`Thiết bị USB: ${info.hasDevice ? `${info.chipName} (${info.vid}:${info.pid})` : "Chưa cắm cáp OTG"}`);
+      lines.push(`Quyền Host: ${info.hasPermission ? "Đã cấp" : "Chưa cấp"} · Trạng thái: ${info.isConnected ? "ĐANG KẾT NỐI" : "Ngắt kết nối"}`);
+      if (info.isConnected || info.rxPackets > 0) {
+        lines.push(`RX: ${info.rxPackets || 0} gói (${info.rxBytes || 0} B) · Mẫu: ${info.lastRxPreview || "--"}`);
+      }
+      if (info.lastError) lines.push(`Lỗi cuối: ${info.lastError}`);
+      box.textContent = lines.join("\n");
+      if ($("btnDisconnectUsb")) $("btnDisconnectUsb").classList.toggle("hidden", !info.isConnected);
+      if ($("btnDisconnectBt")) $("btnDisconnectBt").classList.toggle("hidden", connState !== "connected" || !!info.isConnected);
+    } catch (e) {
+      box.textContent = "Lỗi kiểm tra USB OTG: " + e;
+    }
+  }
+
+  function openBtModal() {
+    if ($("btModal")) $("btModal").classList.remove("hidden");
+    refreshUsbDiag();
+    if (hasBridge() && typeof window.AndroidBT.hasPermissions === "function" && window.AndroidBT.hasPermissions()) {
+      window.AndroidBT.getPairedAndScan();
+    }
+  }
+
+  function openFiModal() {
+    if ($("fiModal")) $("fiModal").classList.remove("hidden");
+    if (hasBridge() || demoActive) sendCmd("DTC");
+  }
+
+  /* ── OFFLINE DEMO / CSV REPLAY & HỘP ĐEN FILE MANAGER ── */
+  function openHudToolbar() {
+    const tb = $("lhudOverlayToolbar");
+    if (!tb) return;
+    tb.classList.add("is-open");
+    if (hudToolbarTimer) clearTimeout(hudToolbarTimer);
+    hudToolbarTimer = setTimeout(closeHudToolbar, 5500);
+  }
+
+  function closeHudToolbar() {
+    if (hudToolbarTimer) { clearTimeout(hudToolbarTimer); hudToolbarTimer = null; }
+    const tb = $("lhudOverlayToolbar");
+    if (tb) tb.classList.remove("is-open");
+  }
+
+  function applyReplayIndex(idx) {
+    if (!replayFrames.length) return;
+    const item = replayFrames[idx];
+    if (!item) return;
+    if (item.kind === "table11") {
+      applyFrame(item);
+    } else if (item.h) {
+      const pkt = Core.parseKlinePacket(item.h);
+      if (pkt && pkt.kind === "table11") applyFrame(pkt);
+    }
+    if ($("replaySlider")) $("replaySlider").value = String(idx);
+    if ($("replayTimeTxt")) $("replayTimeTxt").textContent = `${idx + 1} / ${replayFrames.length}`;
+  }
+
+  function stepDemoTick() {
+    if (!demoActive || !demoPlaying || !replayFrames.length) return;
+    if (demoIdx >= replayFrames.length) demoIdx = 0;
+    applyReplayIndex(demoIdx);
+    demoIdx += 1;
+  }
+
+  function startReplay(frames, badgeLabel, statusLabel) {
+    if (!frames || !frames.length) return;
+    if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
+    replayFrames = frames;
+    replaySourceLabel = badgeLabel || "DEMO";
+    demoActive = true;
+    demoIdx = 0;
+    demoPlaying = true;
+
+    if ($("replaySourceBadge")) $("replaySourceBadge").textContent = replaySourceLabel;
+    if ($("sharedReplayBar")) $("sharedReplayBar").classList.remove("hidden");
+    if ($("pBtnDemo")) $("pBtnDemo").classList.toggle("is-active", replaySourceLabel === "DEMO");
+    if ($("lBtnDemo")) $("lBtnDemo").classList.toggle("is-active", replaySourceLabel === "DEMO");
+    if ($("replaySlider")) {
+      $("replaySlider").max = String(Math.max(0, frames.length - 1));
+      $("replaySlider").value = "0";
+    }
+    if ($("replayPlayBtn")) $("replayPlayBtn").innerHTML = "&#10074;&#10074;";
+
+    applyReplayIndex(0);
+    demoIdx = frames.length > 1 ? 1 : 0;
+    demoTimer = setInterval(stepDemoTick, Math.round(160 / demoSpeed));
+    updateConnIndicators("connected", statusLabel || "DEMO LOG XE THẬT");
+  }
+
+  function stopReplay() {
+    demoActive = false;
+    replayFrames = [];
+    if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
+    if ($("sharedReplayBar")) $("sharedReplayBar").classList.add("hidden");
+    if ($("pBtnDemo")) $("pBtnDemo").classList.remove("is-active");
+    if ($("lBtnDemo")) $("lBtnDemo").classList.remove("is-active");
+    renderIdleState();
+    updateConnIndicators("disconnected", "CHƯA KẾT NỐI");
+  }
+
+  function toggleDemo(forceState) {
+    const next = typeof forceState === "boolean" ? forceState : !demoActive;
+    if (next) {
+      const frames = window.SAMPLE_FRAMES || [];
+      if (!frames.length) return;
+      startReplay(frames, "DEMO", "DEMO LOG XE THẬT");
+    } else {
+      stopReplay();
+    }
+  }
+
+  const FALLBACK_FILES_KEY = "kline_local_session_files";
+  function readSessionFileText(filename) {
+    if (hasBridge() && typeof window.AndroidBT.readSessionFile === "function") {
+      return window.AndroidBT.readSessionFile(filename) || "";
+    }
+    try {
+      const map = JSON.parse(localStorage.getItem(FALLBACK_FILES_KEY) || "{}");
+      return map[filename] ? map[filename].content : "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function saveLocalFallbackFile(filename, content) {
+    try {
+      const map = JSON.parse(localStorage.getItem(FALLBACK_FILES_KEY) || "{}");
+      map[filename] = { content, modifiedMs: Date.now() };
+      const keys = Object.keys(map).sort((a, b) => (map[b].modifiedMs || 0) - (map[a].modifiedMs || 0));
+      keys.slice(12).forEach((k) => delete map[k]);
+      localStorage.setItem(FALLBACK_FILES_KEY, JSON.stringify(map));
+    } catch (_) {}
+  }
+
+  function renderSessionFiles() {
+    const listEl = $("recFilesList");
+    const metaEl = $("recFilesMeta");
+    if (!listEl) return;
+
+    let items = [];
+    if (hasBridge() && typeof window.AndroidBT.listSessionFiles === "function") {
+      try { items = JSON.parse(window.AndroidBT.listSessionFiles() || "[]"); } catch (_) {}
+    } else {
+      try {
+        const map = JSON.parse(localStorage.getItem(FALLBACK_FILES_KEY) || "{}");
+        items = Object.keys(map).map((name) => ({
+          name,
+          sizeBytes: String(map[name].content || "").length,
+          modifiedMs: map[name].modifiedMs || Date.now(),
+          kind: name.toLowerCase().endsWith(".csv") ? "rec" : "log"
+        })).sort((a, b) => b.modifiedMs - a.modifiedMs);
+      } catch (_) {}
+    }
+
+    if (!items.length) {
+      listEl.innerHTML = '<div class="muted-note">Chưa có file ghi nào. Bấm REC để ghi chuyến đi hoặc mở file CSV có sẵn.</div>';
+      if (metaEl) metaEl.textContent = "Chọn file đã ghi để phát lại tua máy, số ảo & Scope.";
+      return;
+    }
+
+    if (metaEl) metaEl.textContent = `Đang lưu ${items.length} file trong hộp đen.`;
+    listEl.innerHTML = "";
+    items.forEach((f) => {
+      const row = document.createElement("div");
+      row.className = "rec-file-item";
+      const dt = f.modifiedMs ? new Date(f.modifiedMs).toLocaleString("vi-VN") : "";
+      const kb = f.sizeBytes >= 1024 ? `${(f.sizeBytes / 1024).toFixed(1)} KB` : `${f.sizeBytes} B`;
+
+      const info = document.createElement("div");
+      info.className = "rec-file-info";
+      info.innerHTML = `<div class="rec-file-name">${f.name}</div><div class="rec-file-sub">${kb} · ${dt}</div>`;
+
+      const acts = document.createElement("div");
+      acts.className = "rec-file-actions";
+
+      const isCsv = f.kind === "rec" || f.name.toLowerCase().endsWith(".csv");
+      const primaryBtn = document.createElement("button");
+      primaryBtn.className = isCsv ? "btn btn-cyan btn-xs" : "btn btn-ghost btn-xs";
+      primaryBtn.textContent = isCsv ? "Phát lại" : "Xem";
+      primaryBtn.addEventListener("click", () => {
+        const content = readSessionFileText(f.name);
+        if (!content) return;
+        if (isCsv) {
+          const parsed = Core.parseRecordedCsv(content);
+          if (!parsed.length) {
+            if (metaEl) metaEl.textContent = `File ${f.name} chưa có dòng dữ liệu hợp lệ.`;
+            return;
+          }
+          startReplay(parsed, "REC", `PHÁT LẠI · ${f.name}`);
+          syncModeAndPages("casual-overview");
+        } else {
+          if ($("fileViewTitle")) $("fileViewTitle").textContent = f.name;
+          if ($("fileViewMeta")) $("fileViewMeta").textContent = `${kb} · ${dt}`;
+          if ($("fileViewBody")) $("fileViewBody").textContent = content;
+          if ($("fileViewModal")) $("fileViewModal").classList.remove("hidden");
+        }
+      });
+      acts.appendChild(primaryBtn);
+
+      const dlBtn = document.createElement("button");
+      dlBtn.className = "btn btn-ghost btn-xs";
+      dlBtn.textContent = "Tải";
+      dlBtn.addEventListener("click", () => {
+        if (hasBridge() && typeof window.AndroidBT.exportSessionToDownloads === "function") {
+          const msg = window.AndroidBT.exportSessionToDownloads(f.name);
+          if (metaEl) metaEl.textContent = `Đã xuất: ${msg}`;
+        } else {
+          const content = readSessionFileText(f.name);
+          const blob = new Blob([content], { type: isCsv ? "text/csv" : "text/plain" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = f.name;
+          a.click();
+        }
+      });
+      acts.appendChild(dlBtn);
+
+      const delBtn = document.createElement("button");
+      delBtn.className = "btn btn-danger btn-xs";
+      delBtn.textContent = "Xóa";
+      delBtn.addEventListener("click", () => {
+        if (hasBridge() && typeof window.AndroidBT.deleteSessionFile === "function") {
+          window.AndroidBT.deleteSessionFile(f.name);
+        } else {
+          try {
+            const map = JSON.parse(localStorage.getItem(FALLBACK_FILES_KEY) || "{}");
+            delete map[f.name];
+            localStorage.setItem(FALLBACK_FILES_KEY, JSON.stringify(map));
+          } catch (_) {}
+        }
+        renderSessionFiles();
+      });
+      acts.appendChild(delBtn);
+
+      row.appendChild(info);
+      row.appendChild(acts);
+      listEl.appendChild(row);
+    });
+  }
+
+  function toggleRec() {
+    isRecording = !isRecording;
+    if ($("pBtnRec")) $("pBtnRec").classList.toggle("is-recording", isRecording);
+    if ($("lBtnRec")) $("lBtnRec").classList.toggle("is-recording", isRecording);
+    if (isRecording) {
+      csvRows = ["Timestamp,RPM,TPS_V,TPS_Pct,ECT_C,IAT_C,MAP_kPa,VBAT_V,VSS_kmh,Gear,INJ_ms,Duty_Pct,IGN_deg,IACV,O2_V,AFR,DFCO"];
+      if ($("pRecTxt")) $("pRecTxt").textContent = "STOP";
+      if ($("lRecTxt")) $("lRecTxt").textContent = "STOP";
+      logAppDebug("REC", "Bắt đầu ghi CSV chuyến đi");
+    } else {
+      if ($("pRecTxt")) $("pRecTxt").textContent = "REC";
+      if ($("lRecTxt")) $("lRecTxt").textContent = "REC";
+      const fname = `kline_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+      const content = csvRows.join("\n");
+      if (hasBridge() && typeof window.AndroidBT.saveSessionCsv === "function") {
+        const res = window.AndroidBT.saveSessionCsv(fname, content);
+        logAppDebug("CSV", `Saved ${csvRows.length - 1} rows -> ${res}`);
+      } else {
+        saveLocalFallbackFile(fname, content);
+      }
+      renderSessionFiles();
+    }
+  }
+
+  /* ── BIND ALL EVENTS ── */
+  function bindEvents() {
+    document.querySelectorAll(".bnav-btn").forEach((btn) => {
+      btn.addEventListener("click", () => syncModeAndPages(btn.dataset.page));
+    });
+
+    const cycleMode = () => {
+      const target = uiMode === "casual" ? "nerdy-telemetry" : "casual-overview";
+      syncModeAndPages(target);
+      closeHudToolbar();
+    };
+    if ($("pBtnModeCycle")) $("pBtnModeCycle").addEventListener("click", cycleMode);
+    if ($("lBtnModeCycle")) $("lBtnModeCycle").addEventListener("click", cycleMode);
+
+    if ($("pBtnDemo")) $("pBtnDemo").addEventListener("click", () => toggleDemo());
+    if ($("lBtnDemo")) $("lBtnDemo").addEventListener("click", () => { toggleDemo(); closeHudToolbar(); });
+    if ($("cBtnEmptyDemo")) $("cBtnEmptyDemo").addEventListener("click", () => toggleDemo(true));
+
+    if ($("pBtnRec")) $("pBtnRec").addEventListener("click", toggleRec);
+    if ($("lBtnRec")) $("lBtnRec").addEventListener("click", () => { toggleRec(); closeHudToolbar(); });
+
+    if ($("pBtnBt")) $("pBtnBt").addEventListener("click", openBtModal);
+    if ($("lBtnBt")) $("lBtnBt").addEventListener("click", openBtModal);
+    if ($("lBtnToolbarConnect")) $("lBtnToolbarConnect").addEventListener("click", () => { closeHudToolbar(); openBtModal(); });
+    if ($("btnCloseModal")) $("btnCloseModal").addEventListener("click", () => $("btModal").classList.add("hidden"));
+
+    if ($("pBtnFi")) $("pBtnFi").addEventListener("click", openFiModal);
+    if ($("lBtnFi")) $("lBtnFi").addEventListener("click", () => { closeHudToolbar(); openFiModal(); });
+    if ($("btnCloseFiModal")) $("btnCloseFiModal").addEventListener("click", () => $("fiModal").classList.add("hidden"));
+
+    /* Landscape HUD bottom toolbar toggle + auto-dismiss */
+    const toggleHudMenu = (e) => {
+      if (e) e.stopPropagation();
+      const tb = $("lhudOverlayToolbar");
+      if (tb && tb.classList.contains("is-open")) closeHudToolbar();
+      else openHudToolbar();
+    };
+    if ($("lBtnHudMenu")) $("lBtnHudMenu").addEventListener("click", toggleHudMenu);
+    const hudDeck = document.querySelector(".lhud-top-deck");
+    if (hudDeck) hudDeck.addEventListener("click", toggleHudMenu);
+    if ($("btnCloseToolbar")) $("btnCloseToolbar").addEventListener("click", closeHudToolbar);
+
+    const lHudEl = $("landscapeHud");
+    if (lHudEl) {
+      lHudEl.addEventListener("click", (e) => {
+        const tb = $("lhudOverlayToolbar");
+        if (!tb || !tb.classList.contains("is-open")) return;
+        if (!tb.contains(e.target) && (!hudDeck || !hudDeck.contains(e.target))) {
+          closeHudToolbar();
+        }
+      });
+    }
+    window.addEventListener("orientationchange", closeHudToolbar);
+    window.addEventListener("resize", closeHudToolbar);
+
+    /* Jump / Open Gear Pull-Learn */
+    if ($("cGearBtn")) {
+      $("cGearBtn").addEventListener("click", () => {
+        syncModeAndPages("nerdy-lab");
+        setTimeout(() => { if ($("gearLearnCard")) $("gearLearnCard").scrollIntoView({ behavior: "smooth" }); }, 60);
+      });
+    }
+    if ($("lcGearBtn")) $("lcGearBtn").addEventListener("click", () => { closeHudToolbar(); $("gearLearnHudModal").classList.remove("hidden"); renderGearLearnerUi(); });
+    if ($("lBtnLearnHud")) $("lBtnLearnHud").addEventListener("click", () => { closeHudToolbar(); $("gearLearnHudModal").classList.remove("hidden"); renderGearLearnerUi(); });
+    if ($("mBtnCloseLearnHud")) $("mBtnCloseLearnHud").addEventListener("click", () => $("gearLearnHudModal").classList.add("hidden"));
+
+    /* Gear Pull-Learn Actions */
+    const onStartPull1 = () => { gearLearner.startPull1(); renderGearLearnerUi(); };
+    const onStartSeq = () => { gearLearner.startAutoSequence(); renderGearLearnerUi(); };
+    const onFinishLearn = () => {
+      const res = gearLearner.finish();
+      if (res.ok && res.ratios) {
+        gearTracker.setModel(res.ratios);
+        saveLearnedGearModel(res.ratios, gearTracker.getModel().sources);
+        logAppDebug("GEAR_LEARN", `Saved model (${res.mode}): ${res.ratios.map((x) => x.toFixed(1)).join(", ")}`);
+      } else {
+        logAppDebug("GEAR_LEARN", `Finish skipped: ${res.reason || "insufficient"}`);
+        if ($("learnStatusTxt")) $("learnStatusTxt").textContent = "Chưa đủ mẫu (cần >= 4 mẫu tốc độ > 5 km/h & > 2200 RPM).";
+      }
+      renderGearLearnerUi();
+    };
+    const onCancelLearn = () => { gearLearner.cancel(); renderGearLearnerUi(); };
+
+    if ($("btnLearnPull1")) $("btnLearnPull1").addEventListener("click", onStartPull1);
+    if ($("mBtnLearnPull1")) $("mBtnLearnPull1").addEventListener("click", onStartPull1);
+    if ($("btnLearnSeq")) $("btnLearnSeq").addEventListener("click", onStartSeq);
+    if ($("mBtnLearnSeq")) $("mBtnLearnSeq").addEventListener("click", onStartSeq);
+    if ($("btnFinishLearn")) $("btnFinishLearn").addEventListener("click", onFinishLearn);
+    if ($("mBtnLearnFinish")) $("mBtnLearnFinish").addEventListener("click", onFinishLearn);
+    if ($("btnCancelLearn")) $("btnCancelLearn").addEventListener("click", onCancelLearn);
+    if ($("mBtnLearnCancel")) $("mBtnLearnCancel").addEventListener("click", onCancelLearn);
+
+    if ($("btnResetGearModel")) {
+      $("btnResetGearModel").addEventListener("click", () => {
+        gearLearner.clearAll();
+        gearTracker.setModel(null);
+        try { localStorage.removeItem(LS_KEYS.learnedRatios); } catch (_) {}
+        renderGearLearnerUi();
+      });
+    }
+
+    document.querySelectorAll(".gear-learn-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        gearLearner.startSingleGear(parseInt(btn.dataset.learnGear, 10));
+        renderGearLearnerUi();
+      });
+    });
+
+    /* Replay Bar & Blackbox File Controls */
+    if ($("replayPlayBtn")) {
+      $("replayPlayBtn").addEventListener("click", () => {
+        demoPlaying = !demoPlaying;
+        $("replayPlayBtn").innerHTML = demoPlaying ? "&#10074;&#10074;" : "&#9654;";
+      });
+    }
+    if ($("replayCloseBtn")) {
+      $("replayCloseBtn").addEventListener("click", stopReplay);
+    }
+    if ($("replaySlider")) {
+      $("replaySlider").addEventListener("input", (e) => {
+        demoIdx = parseInt(e.target.value, 10) || 0;
+        applyReplayIndex(demoIdx);
+      });
+    }
+    if ($("btnRefreshRecFiles")) $("btnRefreshRecFiles").addEventListener("click", renderSessionFiles);
+    if ($("btnImportRecFile") && $("recFileInput")) {
+      $("btnImportRecFile").addEventListener("click", () => $("recFileInput").click());
+      $("recFileInput").addEventListener("change", (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const text = String(reader.result || "");
+          if (file.name.toLowerCase().endsWith(".csv")) {
+            const frames = Core.parseRecordedCsv(text);
+            if (frames.length) {
+              if (hasBridge() && typeof window.AndroidBT.saveSessionCsv === "function") {
+                window.AndroidBT.saveSessionCsv(file.name, text);
+              } else {
+                saveLocalFallbackFile(file.name, text);
+              }
+              renderSessionFiles();
+              startReplay(frames, "CSV", `PHÁT LẠI · ${file.name}`);
+              syncModeAndPages("casual-overview");
+            } else if ($("recFilesMeta")) {
+              $("recFilesMeta").textContent = `Không đọc được cột RPM từ ${file.name}.`;
+            }
+          } else {
+            if ($("fileViewTitle")) $("fileViewTitle").textContent = file.name;
+            if ($("fileViewMeta")) $("fileViewMeta").textContent = `${file.size} B`;
+            if ($("fileViewBody")) $("fileViewBody").textContent = text;
+            if ($("fileViewModal")) $("fileViewModal").classList.remove("hidden");
+          }
+          e.target.value = "";
+        };
+        reader.readAsText(file);
+      });
+    }
+    if ($("btnCloseFileView")) {
+      $("btnCloseFileView").addEventListener("click", () => $("fileViewModal").classList.add("hidden"));
+    }
+    document.querySelectorAll("#sharedReplayBar .speed-btn").forEach((b) => {
+      b.addEventListener("click", () => {
+        document.querySelectorAll("#sharedReplayBar .speed-btn").forEach((x) => x.classList.remove("active"));
+        b.classList.add("active");
+        demoSpeed = parseInt(b.dataset.speed, 10) || 1;
+        if (demoActive) {
+          clearInterval(demoTimer);
+          demoTimer = setInterval(stepDemoTick, Math.round(160 / demoSpeed));
+        }
+      });
+    });
+
+    /* Trip & Min/Max Resets */
+    if ($("btnResetTrip")) {
+      $("btnResetTrip").addEventListener("click", () => {
+        tripStats.startMs = Date.now();
+        tripStats.engineRunSec = 0;
+        tripStats.lastRunTickMs = 0;
+        tripStats.peakRpm = 0;
+        tripStats.peakTps = 0;
+        tripStats.peakVss = 0;
+        tripStats.minVbat = null;
+        tripStats.maxVbat = null;
+        tripStats.warnCount = 0;
+        tripStats.warnBannerActive = false;
+        tripMeters = 0;
+        peakRpm = 0;
+        peakTps = 0;
+        pullTimer.best = null;
+        pullTimer.cur = 0;
+        pullTimer.state = "idle";
+        renderTripStats();
+      });
+    }
+
+    if ($("btnResetOil")) {
+      $("btnResetOil").addEventListener("click", () => {
+        oilKm = 0;
+        saveVal(LS_KEYS.oilKm, "0");
+        renderTripStats();
+      });
+    }
+
+    if ($("nBtnResetBounds")) {
+      $("nBtnResetBounds").addEventListener("click", () => {
+        Object.keys(bounds).forEach((k) => { bounds[k] = [null, null]; });
+      });
+    }
+
+    /* Scope & 3D Map */
+    document.querySelectorAll(".chip").forEach((c) => {
+      c.addEventListener("click", () => {
+        const k = c.dataset.ch;
+        scopeEnabled[k] = !scopeEnabled[k];
+        c.classList.toggle("active", scopeEnabled[k]);
+        drawScope();
+      });
+    });
+    if ($("btnScopeFreeze")) {
+      $("btnScopeFreeze").addEventListener("click", () => {
+        scopeFrozen = !scopeFrozen;
+        $("btnScopeFreeze").classList.toggle("is-active", scopeFrozen);
+      });
+    }
+    if ($("nScopeCanvas")) {
+      $("nScopeCanvas").addEventListener("click", (e) => {
+        const rect = e.target.getBoundingClientRect();
+        const pts = history.slice(-140);
+        if (pts.length < 2) return;
+        const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        scopeCursorIdx = Math.round(frac * (pts.length - 1));
+        drawScope();
+      });
+    }
+
+    document.querySelectorAll("#mapMetricGroup .speed-btn").forEach((b) => {
+      b.addEventListener("click", () => {
+        document.querySelectorAll("#mapMetricGroup .speed-btn").forEach((x) => x.classList.remove("active"));
+        b.classList.add("active");
+        activeMapMetric = b.dataset.metric || "inj";
+        renderMapTable();
+      });
+    });
+    if ($("btnClearMap")) {
+      $("btnClearMap").addEventListener("click", () => {
+        Object.keys(mapCells).forEach((k) => delete mapCells[k]);
+        renderMapTable();
+      });
+    }
+    if ($("btnResetPull")) {
+      $("btnResetPull").addEventListener("click", () => {
+        pullTimer.state = "idle";
+        pullTimer.cur = 0;
+        pullTimer.best = null;
+        updatePullTimer(0);
+      });
+    }
+
+    /* ECU Lab Commands & Redline */
+    if ($("cBtnReadDtc")) $("cBtnReadDtc").addEventListener("click", () => sendCmd("DTC"));
+    if ($("cBtnClearDtc")) $("cBtnClearDtc").addEventListener("click", () => sendCmd("CLEARDTC"));
+    if ($("mBtnReadDtc")) $("mBtnReadDtc").addEventListener("click", () => sendCmd("DTC"));
+    if ($("mBtnClearDtc")) $("mBtnClearDtc").addEventListener("click", () => sendCmd("CLEARDTC"));
+    if ($("lBtnReadDtc")) $("lBtnReadDtc").addEventListener("click", () => sendCmd("DTC"));
+    if ($("lBtnClearDtc")) $("lBtnClearDtc").addEventListener("click", () => sendCmd("CLEARDTC"));
+    if ($("lBtnReadEcmId")) $("lBtnReadEcmId").addEventListener("click", () => sendCmd("ECMID"));
+    if ($("lBtnWakeup")) $("lBtnWakeup").addEventListener("click", () => sendCmd("WAKEUP"));
+    if ($("lBtnScs")) {
+      $("lBtnScs").addEventListener("click", () => {
+        scsActive = !scsActive;
+        $("lBtnScs").classList.toggle("is-active", scsActive);
+        sendCmd("SCS");
+      });
+    }
+    if ($("lBtnProbeTable")) {
+      $("lBtnProbeTable").addEventListener("click", () => {
+        const hex = ($("lTableInput").value || "11").trim().toUpperCase();
+        sendCmd("PROBE " + hex);
+      });
+    }
+    if ($("lRedlineSlider")) {
+      $("lRedlineSlider").value = String(redlineRpm);
+      if ($("lRedlineVal")) $("lRedlineVal").textContent = redlineRpm + " RPM";
+      $("lRedlineSlider").addEventListener("input", (e) => {
+        redlineRpm = parseInt(e.target.value, 10) || 10500;
+        if ($("lRedlineVal")) $("lRedlineVal").textContent = redlineRpm + " RPM";
+        saveVal(LS_KEYS.redline, redlineRpm);
+        rebuildAllTachRails();
+        updateLeds(anim.dispRpm);
+      });
+    }
+    if ($("lBtnPauseHex")) {
+      $("lBtnPauseHex").addEventListener("click", () => {
+        hexPaused = !hexPaused;
+        $("lBtnPauseHex").textContent = hexPaused ? "Tiếp tục" : "Tạm dừng";
+        $("lBtnPauseHex").classList.toggle("is-active", hexPaused);
+      });
+    }
+    if ($("lBtnClearHex")) {
+      $("lBtnClearHex").addEventListener("click", () => {
+        hexLines.length = 0;
+        if ($("lHexConsole")) $("lHexConsole").textContent = "Đã xóa log console.";
+      });
+    }
+    if ($("lBtnRefreshDebug")) $("lBtnRefreshDebug").addEventListener("click", renderDebugConsole);
+    if ($("lBtnOpenRecManager")) {
+      $("lBtnOpenRecManager").addEventListener("click", () => {
+        syncModeAndPages("casual-trip");
+        setTimeout(() => { if ($("recFilesCard")) $("recFilesCard").scrollIntoView({ behavior: "smooth" }); }, 60);
+      });
+    }
+    if ($("lBtnSaveDebug")) {
+      $("lBtnSaveDebug").addEventListener("click", () => {
+        renderDebugConsole();
+        const txt = $("lAppDebugOut") ? $("lAppDebugOut").textContent : "";
+        const fname = `kline_debug_${Date.now()}.log`;
+        if (hasBridge() && typeof window.AndroidBT.saveSessionCsv === "function") {
+          const msg = window.AndroidBT.saveSessionCsv(fname, txt);
+          if ($("lDtcOut")) $("lDtcOut").textContent = "Đã lưu: " + msg;
+        } else {
+          saveLocalFallbackFile(fname, txt);
+          if ($("lDtcOut")) $("lDtcOut").textContent = "Đã lưu log: " + fname;
+        }
+        renderSessionFiles();
+      });
+    }
+
+    /* USB & BT Modal Buttons */
+    if ($("btnConnectUsb")) {
+      $("btnConnectUsb").addEventListener("click", () => {
+        if (hasBridge()) window.AndroidBT.connectUsb();
+        refreshUsbDiag();
+      });
+    }
+    if ($("btnWakeupUsb")) {
+      $("btnWakeupUsb").addEventListener("click", () => {
+        if (hasBridge()) window.AndroidBT.sendWakeup();
+        else sendCmd("WAKEUP");
+      });
+    }
+    if ($("btnDisconnectUsb")) {
+      $("btnDisconnectUsb").addEventListener("click", () => {
+        if (hasBridge()) window.AndroidBT.disconnectUsb();
+        refreshUsbDiag();
+      });
+    }
+    if ($("btnScanBt")) {
+      $("btnScanBt").addEventListener("click", () => {
+        if ($("pairedList")) $("pairedList").innerHTML = '<div class="muted-note">Đang tải thiết bị đã ghép đôi...</div>';
+        if ($("bleList")) $("bleList").innerHTML = '<div class="muted-note">Đang quét BLE...</div>';
+        if (hasBridge()) {
+          if (!window.AndroidBT.hasPermissions()) window.AndroidBT.requestBtPermissions();
+          else window.AndroidBT.getPairedAndScan();
+        }
+      });
+    }
+    if ($("btnDisconnectBt")) {
+      $("btnDisconnectBt").addEventListener("click", () => {
+        if (hasBridge()) window.AndroidBT.disconnect();
+      });
+    }
+  }
+
+  /* ── INIT & WATCHERS ── */
+  function init() {
+    rebuildAllTachRails();
+    renderIdleState();
+    renderTripStats();
+    renderMapTable();
+    renderGearLearnerUi();
+    bindEvents();
+    syncModeAndPages("casual-overview");
+    updateConnIndicators("disconnected", "CHƯA KẾT NỐI");
+
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => {
+        if (currentPage === "casual-overview") drawOverviewChart();
+        if (currentPage === "nerdy-tuning") drawScope();
+      });
+      if ($("pOverviewChart")) ro.observe($("pOverviewChart"));
+      if ($("nScopeCanvas")) ro.observe($("nScopeCanvas"));
+    }
+
+    // Stale live-frame watchdog: reset to idle glow if ECU drops > 4s (outside Demo)
+    setInterval(() => {
+      if (hasLiveData && !demoActive && lastFramePerf > 0 && performance.now() - lastFramePerf > 4200) {
+        if ($("cHealthText")) $("cHealthText").textContent = "MẤT TÍN HIỆU ECU (> 4s)";
+        if ($("lBannerTxt")) $("lBannerTxt").textContent = "MẤT TÍN HIỆU ECU";
+      }
+    }, 1000);
+
+    // Expose dev debug helpers
+    window.__klineApp = {
+      gearTracker,
+      gearLearner,
+      applyFrame,
+      syncModeAndPages,
+      toggleDemo,
+      startReplay,
+      stopReplay,
+      openHudToolbar,
+      closeHudToolbar,
+      renderSessionFiles,
+      getAppDebugLogs: () => jsDebugBuffer.slice()
+    };
+  }
+
+  init();
 })();

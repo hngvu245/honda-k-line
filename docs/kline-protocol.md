@@ -78,3 +78,20 @@ ECU Keihin xuất nhiều cảm biến theo từng **cặp đôi**: `[Điện á
 Trong log tại `19:11:42` khi buông hết ga (`TPS = 0%`) ở `5.343 RPM`:
 * Kim phun lập tức đóng kín về **`0.00 ms`** (`ecu[18..19] = 00 00`) và áp suất cổ hút tụt về chân không mạnh (`29 – 35 kPa`).
 * Điều kiện hiển thị cờ **`DFCO CUT`** trên Dashboard: `rpm > 2200 && ecu[7] == 0 && inj_ms == 0.0`.
+
+---
+
+## 4. Thuật Toán Ước Lượng & Tự Học Cấp Số Ảo (Virtual Gear v3)
+
+Vì giắc K-Line Keihin không xuất byte cảm biến số, cả PC (`dashboard.py`) và Android (`kline_core.js`) ước lượng số từ `RPM`, `VSS`, kết hợp `TPS (%)` và `INJ (ms)` trong Table `11`:
+
+1. **Chia vùng Voronoi trung bình nhân:** Ranh giới chuyển tiếp giữa số $i$ và $i+1$ đặt tại $\sqrt{R_i \cdot R_{i+1}}$ (xóa bỏ khoảng chết giữa các số); biên ngoài ở số 1 mở rộng thích ứng theo `VSS` (`R_1 * (1.28 + 1.5 / max(VSS, 2))`), biên dưới `R_N * 0.84`.
+2. **Bù lượng tử tốc độ thấp (`VSS < 15 km/h`):** Giữ số hiện tại nếu khoảng $[RPM / (VSS + 0.7), RPM / \max(1, VSS - 0.7)]$ còn giao với vùng số đang gài.
+3. **Chống nhảy số khi âm côn trôi xe (`Anti-Coasting & Clutch-In Classifier`):**
+   - **Tự học garanti thực (`idleRpm`):** Học EMA khi `VSS < 2, TPS <= 1.2%, 450 <= RPM <= 2400` để tính trần garanti `idleCeil = idleRpm + 320`.
+   - **Bắt cắt côn & vùng garanti:** Khi `VSS >= 4` và `TPS <= 2.5%`, nếu tua rớt (`dRPM <= -220` hoặc 2 khung `dRPM <= -110`) hoặc rơi vào vùng garanti (`RPM <= idleCeil`) mà kim phun vẫn mở nuôi máy (`INJ > 0.4 ms`), khóa cứng số hiện tại (`frozenByClutch = true`, hiển thị `"Âm côn · trôi"`) suốt thời gian trôi xe.
+   - **Chốt chặn lên số & nhả khóa:** Chặn mọi `upshift` khi `TPS <= 2.5% && RPM < max(2300, idleRpm + 650) && dRPM <= 0`. Chỉ mở khóa khi vặn ga lại (`TPS > 3.5%` 2 khung), tăng tua đồng bộ (`dRPM > 220` trên `idleCeil`), hoặc hãm máy DFCO (`INJ < 0.05 ms` ở `RPM > idleCeil + 300`) ổn định 3 khung.
+4. **Hysteresis theo bước nhảy:** Đổi sang số liền kề (`±1`) cần `2` khung liên tiếp; nhảy cóc `>= 2` số cần `4` khung và `RPM >= 1800`. Giữ số tối đa `1200 ms` trước khi trả `--`.
+5. **Tự học qua cú kéo tua trên xe (`GearPullLearner` trên Android):**
+   - **Học Số 1 (Kéo max tua):** Lấy mẫu khi côn đã bắt hoàn toàn (`VSS >= 6`, `RPM >= 2200`, `TPS >= 4%`, `dRPM >= -150`), ưu tiên dải tốc độ lớn và lọc nhiễu bằng MAD median để chốt `R1`, sau đó tạm nội suy số `2..6` theo bước truyền chuẩn (`[1.0, 0.6685, 0.4863, 0.3893, 0.3364, 0.2948]`).
+   - **Tự học liên hoàn `1 -> N` / Học từng số:** Phát hiện sang số tự động khi tỷ số giảm `>= 18%` ổn định `>= 4` khung để khóa trực tiếp từng cấp số thực tế của xe.
